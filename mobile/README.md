@@ -1,5 +1,29 @@
 # a-eye mobile
 
+Assistive navigation application for blind users using computer vision and AI.
+
+## Setup
+
+1. Install dependencies
+
+   ```bash
+   npm install
+   ```
+
+2. Configure backend server URL
+
+   ```bash
+   cp .env.example .env
+   ```
+
+   Edit `.env` and update `BACKEND_SERVER_URL` with your laptop's IP address.
+
+3. Start the app
+
+   ```bash
+   npm start
+   ```
+
 ## Local module wiring (expo-stream-audio)
 
 This app uses a local copy of `expo-stream-audio`.
@@ -11,7 +35,7 @@ This app uses a local copy of `expo-stream-audio`.
   ```
 - Native updates inside `expo-stream-audio/ios` or `expo-stream-audio/android` require a dev-client rebuild:
   ```bash
-  npm run build:dev:local
+  npm run build:dev
   ```
 - If Metro is sticky, clean caches:
   ```bash
@@ -24,6 +48,6 @@ This app uses a local copy of `expo-stream-audio`.
 npm install
 npm run typecheck
 npm run module:build
-npm run build:dev:local
+npm run build:dev
 npm run metro:clean
 ```

@@ -13,7 +13,8 @@
       "bundleIdentifier": "com.aeye.aeye",
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false,
-        "NSMicrophoneUsageDescription": "A-eye needs microphone access to stream audio."
+        "NSMicrophoneUsageDescription": "A-eye needs microphone access to stream audio.",
+        "NSCameraUsageDescription": "Helios needs camera access to provide visual guidance and navigation assistance."
       }
     },
     "android": {
@@ -26,8 +27,7 @@
       "edgeToEdgeEnabled": true,
       "predictiveBackGestureEnabled": false,
       "permissions": [
-        "android.permission.RECORD_AUDIO",
-        "android.permission.MODIFY_AUDIO_SETTINGS",
+        "android.permission.CAMERA",
         "android.permission.RECORD_AUDIO",
         "android.permission.MODIFY_AUDIO_SETTINGS"
       ],
@@ -51,7 +51,13 @@
           }
         }
       ],
-      "expo-stream-audio"
+      "expo-stream-audio",
+      [
+        "react-native-vision-camera",
+        {
+          "cameraPermissionText": "Helios needs camera access to provide visual guidance and navigation assistance."
+        }
+      ]
     ],
     "experiments": {
       "typedRoutes": true,

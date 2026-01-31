@@ -56,14 +56,12 @@ export function useWebSocket(): UseWebSocketReturn {
       setStatus("connecting");
     });
 
-    socket.on("connect_error", (error: Error) => {
-      console.error("WebSocket connection error:", error.message);
-      setStatus("error");
+    socket.on("connect_error", () => {
+      setStatus("connecting");
     });
 
-    socket.on("error", (error: unknown) => {
-      console.error("WebSocket error:", error);
-      setStatus("error");
+    socket.on("error", () => {
+      setStatus("connecting");
     });
 
     socketRef.current = socket;
@@ -83,8 +81,6 @@ export function useWebSocket(): UseWebSocketReturn {
         frame: base64Frame,
         debug,
       });
-    } else {
-      console.warn("Cannot send frame: WebSocket not connected");
     }
   }, []);
 

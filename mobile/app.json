@@ -42,7 +42,9 @@
             "backgroundColor": "#000000"
           }
         }
-      ]
+      ],
+      "expo-audio",
+      "expo-stream-audio"
     ],
     "experiments": {
       "typedRoutes": true,

@@ -17,12 +17,15 @@ import cv2
 import networkx as nx
 import numpy as np
 import socketio
+import sounddevice as sd
 import torch
 import uvicorn
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from PIL import Image
 from ultralytics import YOLO
+
+from gemini_service import GeminiLiveNarrator, NarrationResult
 
 # Load environment variables
 load_dotenv()
@@ -54,6 +57,9 @@ socket_app = socketio.ASGIApp(
 
 # Global YOLO model (loaded at startup)
 yolo_model = None
+
+# Global Gemini narrator (loaded at startup)
+gemini_narrator = None
 
 # Vehicle classes that trigger emergency warnings
 VEHICLE_CLASSES = {'car', 'bus', 'truck', 'motorcycle', 'bicycle'}
@@ -789,6 +795,30 @@ def process_detections(results, image_height: int, image_width: int) -> Dict[str
     }
 
 
+def play_audio_on_server(audio_data: bytes, sample_rate: int = 24000):
+    """
+    Play PCM audio data through server speakers for testing.
+
+    Args:
+        audio_data: Raw PCM audio bytes (16-bit, mono)
+        sample_rate: Sample rate in Hz (default: 24000 for Gemini)
+    """
+    try:
+        # Convert bytes to numpy array (int16 PCM format)
+        audio_array = np.frombuffer(audio_data, dtype=np.int16)
+
+        # Convert to float32 in range [-1.0, 1.0] for sounddevice
+        audio_float = audio_array.astype(np.float32) / 32768.0
+
+        # Play audio (blocking)
+        logger.info(f"🔊 Playing audio on server speakers ({len(audio_data)} bytes, {sample_rate}Hz)...")
+        sd.play(audio_float, samplerate=sample_rate, blocking=True)
+        logger.info("✓ Audio playback complete")
+
+    except Exception as e:
+        logger.error(f"✗ Failed to play audio on server: {e}")
+
+
 def generate_summary(objects: List[Dict[str, Any]],
                     clusters: List[Dict[str, Any]]) -> str:
     """
@@ -923,73 +953,62 @@ def generate_summary(objects: List[Dict[str, Any]],
         return f"{main_part.capitalize()}, and {last_part}."
 
 
-def prepare_gemini_input(image: np.ndarray, summary: str, emergency_stop: bool) -> Dict[str, Any]:
+async def call_gemini(scene_analysis: Dict[str, Any], image_base64: str) -> Optional[NarrationResult]:
     """
-    Prepare input data for Gemini LLM integration.
-
-    This function packages the original image and YOLO detection summary
-    for passing to Gemini for natural language processing and response generation.
+    Call Gemini Live API for audio narration using Ben's implementation.
 
     Args:
-        image: Original BGR image from OpenCV (numpy array)
-        summary: Natural language description of detected objects/clusters
-        emergency_stop: Whether an emergency condition was detected
+        scene_analysis: Dict with 'summary', 'objects', 'emergency_stop'
+        image_base64: Base64-encoded JPEG image
 
     Returns:
-        Dict containing:
-            - image_rgb: RGB PIL Image (Gemini-compatible format)
-            - summary: Natural language YOLO summary
-            - emergency_stop: Emergency flag
-            - timestamp: ISO timestamp
+        NarrationResult with audio data and metrics, or None if Gemini not available
     """
-    # Convert BGR (OpenCV) to RGB (PIL/Gemini format)
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    pil_image = Image.fromarray(image_rgb)
+    if gemini_narrator is None:
+        logger.warning("⚠️  Gemini narrator not initialized, skipping narration")
+        return None
 
-    return {
-        "image": pil_image,  # PIL Image in RGB format
-        "summary": summary,  # Natural language YOLO summary
-        "emergency_stop": emergency_stop,  # Emergency flag for urgent responses
-        "timestamp": datetime.now(timezone.utc).isoformat()
-    }
+    try:
+        logger.info("🤖 Calling Gemini Live API for narration...")
+        logger.info(f"   Summary: {scene_analysis.get('summary', 'N/A')}")
+        logger.info(f"   Emergency: {scene_analysis.get('emergency_stop', False)}")
 
+        # Call Ben's Gemini implementation
+        result = await gemini_narrator.narrate_with_image(
+            scene_analysis=scene_analysis,
+            image_base64=image_base64
+        )
 
-async def call_gemini(gemini_input: Dict[str, Any]) -> Optional[str]:
-    """
-    Placeholder for Gemini API integration.
+        logger.info(f"✓ Gemini narration complete:")
+        logger.info(f"   Latency: {result.latency_ms:.1f}ms")
+        logger.info(f"   Total: {result.total_ms:.1f}ms")
+        logger.info(f"   Audio size: {len(result.audio_data)} bytes")
+        logger.info(f"   Cached: {result.cached}")
+        if result.transcript:
+            logger.info(f"   Transcript: {result.transcript}")
 
-    TODO: Implement Gemini API call here
-    - Use gemini_input['image'] (PIL Image) for visual context
-    - Use gemini_input['summary'] (str) for YOLO detection context
-    - Use gemini_input['emergency_stop'] (bool) to prioritize urgent responses
+        return result
 
-    Args:
-        gemini_input: Prepared input from prepare_gemini_input()
-
-    Returns:
-        Gemini's natural language response (str) or None if not implemented
-    """
-    # TODO: Add Gemini API implementation here
-    # Example structure:
-    # import google.generativeai as genai
-    # genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-    # model = genai.GenerativeModel('gemini-2.0-flash-exp')
-    # response = model.generate_content([
-    #     gemini_input['image'],
-    #     f"Scene Analysis: {gemini_input['summary']}"
-    # ])
-    # return response.text
-
-    logger.info("📋 Gemini input prepared (API not yet implemented)")
-    logger.info(f"   Summary: {gemini_input['summary']}")
-    logger.info(f"   Emergency: {gemini_input['emergency_stop']}")
-    return None
+    except Exception as e:
+        logger.error(f"✗ Gemini narration failed: {e}", exc_info=True)
+        return None
 
 
 @app.on_event("startup")
 async def startup_event():
     """Load YOLO model and setup debug output directory when server starts."""
+    global gemini_narrator
+
     load_yolo_model()
+
+    # Initialize Gemini narrator
+    try:
+        logger.info("🤖 Initializing Gemini Live Narrator...")
+        gemini_narrator = GeminiLiveNarrator()
+        logger.info("✓ Gemini Live Narrator initialized successfully")
+    except Exception as e:
+        logger.error(f"✗ Failed to initialize Gemini narrator: {e}")
+        logger.warning("⚠️  Server will continue without Gemini narration")
 
     # Setup debug output directory
     if SAVE_DEBUG_FRAMES:
@@ -1147,17 +1166,33 @@ async def video_frame(sid, data):
                 # Don't crash the websocket if disk I/O fails
                 logger.error(f"⚠️  Failed to save debug frame: {disk_error}")
 
-        # Step 6: Prepare input for Gemini and call the LLM
-        gemini_input = prepare_gemini_input(image, summary, emergency_stop)
-        gemini_response = await call_gemini(gemini_input)
+        # Step 6: Call Gemini Live API for audio narration
+        scene_analysis = {
+            "summary": summary,
+            "objects": objects,
+            "emergency_stop": emergency_stop
+        }
 
-        # TODO: Once Gemini is implemented, send gemini_response back to mobile client
-        # if gemini_response:
-        #     await sio.emit('assistant_response', {
-        #         'response': gemini_response,
-        #         'emergency': emergency_stop,
-        #         'timestamp': gemini_input['timestamp']
-        #     }, room=sid)
+        narration_result = await call_gemini(scene_analysis, base64_frame)
+
+        # Send audio narration to client if available
+        if narration_result:
+            # Play audio on server speakers for testing (blocking call)
+            play_audio_on_server(narration_result.audio_data, sample_rate=24000)
+
+            # Convert audio data to base64 for transmission
+            audio_base64 = base64.b64encode(narration_result.audio_data).decode('utf-8')
+
+            await sio.emit('audio_narration', {
+                'audio_data': audio_base64,  # Base64-encoded PCM audio (24kHz, 16-bit, mono)
+                'transcript': narration_result.transcript,
+                'latency_ms': narration_result.latency_ms,
+                'total_ms': narration_result.total_ms,
+                'cached': narration_result.cached,
+                'emergency': emergency_stop,
+                'timestamp': response['timestamp']
+            }, room=sid)
+            logger.info("🔊 Audio narration sent to client")
 
     except Exception as e:
         logger.error(f"Error processing video frame: {e}", exc_info=True)

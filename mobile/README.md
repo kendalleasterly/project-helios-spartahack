@@ -1,8 +1,8 @@
-# Welcome to your Expo app 👋
+# a-eye mobile
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+Assistive navigation application for blind users using computer vision and AI.
 
-## Get started
+## Setup
 
 1. Install dependencies
 
@@ -10,41 +10,44 @@ This is an [Expo](https://expo.dev) project created with [`create-expo-app`](htt
    npm install
    ```
 
-2. Start the app
+2. Configure backend server URL
 
    ```bash
-   npx expo start
+   cp .env.example .env
    ```
 
-In the output, you'll find options to open the app in a
+   Edit `.env` and update `BACKEND_SERVER_URL` with your laptop's IP address.
 
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
+3. Start the app
 
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
+   ```bash
+   npm start
+   ```
 
-## Get a fresh project
+## Local module wiring (expo-stream-audio)
 
-When you're ready, run:
+This app uses a local copy of `expo-stream-audio`.
+
+- Dependency is pinned to the local folder: `"expo-stream-audio": "file:./expo-stream-audio"` in `package.json`.
+- JS updates inside `expo-stream-audio/src` require building the module:
+  ```bash
+  npm run module:build
+  ```
+- Native updates inside `expo-stream-audio/ios` or `expo-stream-audio/android` require a dev-client rebuild:
+  ```bash
+  npm run build:dev
+  ```
+- If Metro is sticky, clean caches:
+  ```bash
+  npm run metro:clean
+  ```
+
+## Common commands
 
 ```bash
-npm run reset-project
+npm install
+npm run typecheck
+npm run module:build
+npm run build:dev
+npm run metro:clean
 ```
-
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
-
-## Learn more
-
-To learn more about developing your project with Expo, look at the following resources:
-
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
-
-## Join the community
-
-Join our community of developers creating universal apps.
-
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.

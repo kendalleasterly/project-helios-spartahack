@@ -12,7 +12,9 @@
       "supportsTablet": true,
       "bundleIdentifier": "com.aeye.aeye",
       "infoPlist": {
-        "ITSAppUsesNonExemptEncryption": false
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSMicrophoneUsageDescription": "A-eye needs microphone access to stream audio.",
+        "NSCameraUsageDescription": "Helios needs camera access to provide visual guidance and navigation assistance."
       }
     },
     "android": {
@@ -23,7 +25,13 @@
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
       "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.MODIFY_AUDIO_SETTINGS"
+      ],
+      "package": "com.aeye.aeye"
     },
     "web": {
       "output": "static",
@@ -41,6 +49,13 @@
           "dark": {
             "backgroundColor": "#000000"
           }
+        }
+      ],
+      "expo-stream-audio",
+      [
+        "react-native-vision-camera",
+        {
+          "cameraPermissionText": "Helios needs camera access to provide visual guidance and navigation assistance."
         }
       ]
     ],

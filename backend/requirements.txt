@@ -12,3 +12,6 @@ networkx==3.2.1
 
 # Test client dependencies
 colorama==0.4.6
+google-genai>=1.0.0
+python-dotenv>=1.0.0
+cachetools>=5.0.0

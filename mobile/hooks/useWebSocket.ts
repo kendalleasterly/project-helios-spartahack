@@ -30,7 +30,7 @@ export function useWebSocket(): UseWebSocketReturn {
       reconnection: true,
       reconnectionDelay: 1000,
       reconnectionDelayMax: 5000,
-      reconnectionAttempts: 5,
+      reconnectionAttempts: Infinity,
     });
 
     socket.on('connect', () => {
@@ -44,12 +44,17 @@ export function useWebSocket(): UseWebSocketReturn {
 
     socket.on('disconnect', (reason) => {
       console.log('WebSocket disconnected:', reason);
-      setStatus('disconnected');
+      setStatus('connecting');
+    });
+
+    socket.on('reconnect_attempt', (attemptNumber) => {
+      console.log(`WebSocket reconnect attempt #${attemptNumber}`);
+      setStatus('connecting');
     });
 
     socket.on('connect_error', (error) => {
-      console.error('WebSocket connection error:', error);
-      setStatus('error');
+      console.error('WebSocket connection error:', error.message);
+      setStatus('connecting');
     });
 
     socket.on('error', (error) => {

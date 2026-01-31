@@ -1,6 +1,6 @@
-# Welcome to your Expo app 👋
+# Project Helios - Mobile App
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+Assistive navigation application for blind users using computer vision and AI.
 
 ## Get started
 
@@ -10,10 +10,18 @@ This is an [Expo](https://expo.dev) project created with [`create-expo-app`](htt
    npm install
    ```
 
-2. Start the app
+2. Configure backend server URL
 
    ```bash
-   npx expo start
+   cp .env.example .env
+   ```
+
+   Edit `.env` and update `BACKEND_SERVER_URL` with your laptop's IP address.
+
+3. Start the app
+
+   ```bash
+   npm start
    ```
 
 In the output, you'll find options to open the app in a

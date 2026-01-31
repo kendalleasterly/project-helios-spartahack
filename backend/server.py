@@ -26,6 +26,7 @@ from PIL import Image
 from ultralytics import YOLO
 
 from gemini_service import GeminiLiveNarrator, NarrationResult
+from contextual_gemini_service import GeminiContextualNarrator
 
 # Load environment variables
 load_dotenv()
@@ -58,8 +59,9 @@ socket_app = socketio.ASGIApp(
 # Global YOLO model (loaded at startup)
 yolo_model = None
 
-# Global Gemini narrator (loaded at startup)
-gemini_narrator = None
+# Global Gemini narrators (loaded at startup)
+gemini_narrator = None  # Legacy Live API narrator
+contextual_narrator = None  # New streaming text narrator
 
 # Vehicle classes that trigger emergency warnings
 VEHICLE_CLASSES = {'car', 'bus', 'truck', 'motorcycle', 'bicycle'}
@@ -997,18 +999,26 @@ async def call_gemini(scene_analysis: Dict[str, Any], image_base64: str) -> Opti
 @app.on_event("startup")
 async def startup_event():
     """Load YOLO model and setup debug output directory when server starts."""
-    global gemini_narrator
+    global gemini_narrator, contextual_narrator
 
     load_yolo_model()
 
-    # Initialize Gemini narrator
+    # Initialize Contextual Gemini narrator (primary)
     try:
-        logger.info("🤖 Initializing Gemini Live Narrator...")
+        logger.info("🤖 Initializing Contextual Gemini Narrator...")
+        contextual_narrator = GeminiContextualNarrator()
+        logger.info("✓ Contextual Narrator initialized successfully")
+    except Exception as e:
+        logger.error(f"✗ Failed to initialize contextual narrator: {e}")
+        logger.warning("⚠️  Server will continue without Gemini narration")
+
+    # Initialize Legacy Gemini Live narrator (fallback)
+    try:
+        logger.info("🤖 Initializing Gemini Live Narrator (fallback)...")
         gemini_narrator = GeminiLiveNarrator()
         logger.info("✓ Gemini Live Narrator initialized successfully")
     except Exception as e:
         logger.error(f"✗ Failed to initialize Gemini narrator: {e}")
-        logger.warning("⚠️  Server will continue without Gemini narration")
 
     # Setup debug output directory
     if SAVE_DEBUG_FRAMES:
@@ -1049,6 +1059,135 @@ async def connect(sid, environ):
 async def disconnect(sid):
     """Handle client disconnection."""
     logger.info(f"✗ Client disconnected: {sid}")
+
+
+@sio.event
+async def video_frame_streaming(sid, data):
+    """
+    Process video frame with streaming text response (NEW APPROACH).
+
+    This uses the contextual Gemini narrator that:
+    1. Decides whether to speak based on context
+    2. Streams text tokens to phone for on-device TTS
+    3. Maintains conversation history
+
+    Data format:
+    {
+        'frame': base64_image,
+        'user_question': Optional[str],  # User's question if any
+        'debug': bool
+    }
+    """
+    try:
+        start_time = asyncio.get_event_loop().time()
+
+        # Extract frame
+        if 'frame' not in data:
+            logger.error("No 'frame' field in received data")
+            await sio.emit('error', {'message': 'Missing frame data'}, room=sid)
+            return
+
+        base64_frame = data['frame']
+        user_question = data.get('user_question', None)
+        debug_mode = data.get('debug', False)
+
+        # Step 1: Decode image
+        image = decode_base64_image(base64_frame)
+        image_height, image_width = image.shape[:2]
+        logger.info(f"📷 Frame: {image_width}x{image_height} | Question: {user_question or 'None'}")
+
+        # Step 2: Run YOLO inference
+        inference_start = asyncio.get_event_loop().time()
+
+        NAV_CLASSES = [0, 13, 24, 39, 41, 42, 43, 44, 45, 56, 57, 62, 63, 64, 65, 66, 67, 73]
+
+        with torch.no_grad():
+            results = yolo_model(
+                image,
+                verbose=False,
+                conf=0.25,
+                iou=0.45,
+                imgsz=1280,
+                classes=NAV_CLASSES,
+                agnostic_nms=True
+            )
+
+        inference_ms = (asyncio.get_event_loop().time() - inference_start) * 1000
+        logger.info(f"⚡ YOLO inference: {inference_ms:.2f}ms")
+
+        # Step 3: Process detections
+        detection_data = process_detections(results, image_height, image_width)
+        objects = detection_data['objects']
+        clusters = detection_data['clusters']
+        emergency_stop = detection_data['emergency_stop']
+
+        # Step 4: Generate summary
+        summary = generate_summary(objects, clusters)
+
+        # Step 5: Build scene analysis
+        scene_analysis = {
+            "summary": summary,
+            "objects": objects,
+            "emergency_stop": emergency_stop
+        }
+
+        # Step 6: Stream Gemini response
+        if contextual_narrator:
+            logger.info("🤖 Calling Contextual Gemini (streaming mode)...")
+
+            token_count = 0
+            first_token_time = None
+
+            async for should_speak, text_chunk in contextual_narrator.process_streaming(
+                scene_analysis=scene_analysis,
+                image_base64=base64_frame,
+                user_question=user_question
+            ):
+                if first_token_time is None:
+                    first_token_time = asyncio.get_event_loop().time()
+                    gemini_latency = (first_token_time - start_time) * 1000
+                    logger.info(f"✓ First token: {gemini_latency:.1f}ms")
+
+                if should_speak:
+                    # Stream text token to phone for TTS
+                    await sio.emit('text_token', {
+                        'token': text_chunk,
+                        'emergency': emergency_stop,
+                        'is_first': (token_count == 0)
+                    }, room=sid)
+                    token_count += 1
+                else:
+                    # Silent response - log but don't send
+                    logger.info(f"🔇 SILENT response: {text_chunk}")
+                    break
+
+            if token_count > 0:
+                logger.info(f"🔊 Streamed {token_count} text tokens to client")
+
+        else:
+            logger.warning("⚠️  Contextual narrator not initialized")
+
+        # Step 7: Send debug frame if requested
+        if debug_mode:
+            annotated_image = annotate_frame(image, objects, emergency_stop)
+            _, buffer = cv2.imencode('.jpg', annotated_image)
+            debug_base64 = base64.b64encode(buffer).decode('utf-8')
+
+            await sio.emit('debug_frame', {
+                'frame': f"data:image/jpeg;base64,{debug_base64}",
+                'summary': summary,
+                'object_count': len(objects)
+            }, room=sid)
+
+        total_time = (asyncio.get_event_loop().time() - start_time) * 1000
+        logger.info(f"✓ Total pipeline: {total_time:.1f}ms | Objects: {len(objects)} | Emergency: {emergency_stop}")
+
+    except Exception as e:
+        logger.error(f"Error processing video frame: {e}", exc_info=True)
+        await sio.emit('error', {
+            'message': 'Frame processing failed',
+            'error': str(e)
+        }, room=sid)
 
 
 @sio.event

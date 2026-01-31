@@ -51,3 +51,6 @@ logs/
 # Environment variables
 .env
 .env.local
+
+# DO NOT COMMIT THIS FUCKING FILE
+vertex-api-key.json 

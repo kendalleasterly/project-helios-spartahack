@@ -5,22 +5,59 @@ Low-latency, real-time audio narration using Vertex AI Live API.
 Combines YOLO scene analysis with raw image for rich understanding.
 """
 
+import asyncio
+import base64
+import concurrent.futures
+import hashlib
+import io
 import os
 import time
-import base64
-import asyncio
-import hashlib
 import wave
-import io
-import concurrent.futures
+from collections import deque
 from dataclasses import dataclass
 from typing import AsyncGenerator, Optional
-from google import genai
-from google.genai.types import LiveConnectConfig, Part, SpeechConfig, VoiceConfig
-from dotenv import load_dotenv
+
 from cachetools import TTLCache
+from dotenv import load_dotenv
+from google import genai
+from google.genai.types import (LiveConnectConfig, Part, SpeechConfig,
+                                VoiceConfig)
 
 load_dotenv()
+
+
+class RateLimiter:
+    """Simple sliding window rate limiter."""
+
+    def __init__(self, max_calls: int = 10, window_seconds: float = 60.0):
+        """
+        Args:
+            max_calls: Maximum calls allowed in the window
+            window_seconds: Time window in seconds
+        """
+        self.max_calls = max_calls
+        self.window_seconds = window_seconds
+        self.calls = deque()
+
+    def is_allowed(self) -> bool:
+        """Check if a call is allowed and record it if so."""
+        now = time.time()
+
+        # Remove old calls outside the window
+        while self.calls and self.calls[0] < now - self.window_seconds:
+            self.calls.popleft()
+
+        if len(self.calls) < self.max_calls:
+            self.calls.append(now)
+            return True
+        return False
+
+    def wait_time(self) -> float:
+        """Return seconds until next call is allowed (0 if allowed now)."""
+        if len(self.calls) < self.max_calls:
+            return 0.0
+        oldest = self.calls[0]
+        return max(0.0, oldest + self.window_seconds - time.time())
 
 # Set the credentials path for Google Cloud
 if os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
@@ -68,7 +105,9 @@ class GeminiLiveNarrator:
         self,
         model: str = "gemini-live-2.5-flash-native-audio",
         cache_ttl: int = 30,
-        cache_maxsize: int = 100
+        cache_maxsize: int = 100,
+        rate_limit_calls: int = 10,
+        rate_limit_window: float = 60.0
     ):
         project = os.environ.get("GOOGLE_CLOUD_PROJECT")
         location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
@@ -83,6 +122,7 @@ class GeminiLiveNarrator:
         )
         self.model = model
         self.cache = TTLCache(maxsize=cache_maxsize, ttl=cache_ttl)
+        self.rate_limiter = RateLimiter(max_calls=rate_limit_calls, window_seconds=rate_limit_window)
 
     def _cache_key(self, scene_analysis: dict, image_hash: Optional[str] = None) -> str:
         """Generate cache key from semantic content."""
@@ -141,7 +181,7 @@ class GeminiLiveNarrator:
         """
         start_time = time.perf_counter()
 
-        # Check cache
+        # Check cache first (cache hits don't count against rate limit)
         image_bytes = self._decode_image(image_base64)
         image_hash = hashlib.md5(image_bytes).hexdigest()
         cache_key = self._cache_key(scene_analysis, image_hash)
@@ -156,6 +196,11 @@ class GeminiLiveNarrator:
                 total_ms=elapsed,
                 cached=True
             )
+
+        # Rate limit check (only for non-cached requests)
+        if not self.rate_limiter.is_allowed():
+            wait = self.rate_limiter.wait_time()
+            raise RuntimeError(f"RATE LIMITED SLOW DOWN OMG THIS EXPENSIVE. Try again in {wait:.1f}s")
 
         # Build multimodal content
         text_prompt = self._build_prompt(scene_analysis)

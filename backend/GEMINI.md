@@ -4,19 +4,22 @@
 
 This document describes the Gemini AI integration for the blind user camera assistant. The goal is to provide real-time audio narration based on YOLO object detection + camera images.
 
-## Current Status: 🔴 In Progress
+## Current Status: 🟢 Working
 
-The Gemini Live API integration is **not yet working**. We've set up the infrastructure but are encountering issues with the Vertex AI Live API connection.
+The Gemini Live API integration is **working**. Audio narration is generated via Vertex AI Live API with smart throttling to avoid excessive narration.
 
 ## What We Built
 
 ### Files Created
 
-- **`gemini_service.py`** - Main service class for Gemini integration
-  - `GeminiLiveNarrator` - Async class using Vertex AI Live API
-  - `GeminiNarrator` - Sync wrapper
+- **`gemini_service.py`** - Main service classes for Gemini integration
+  - `GeminiLiveNarrator` - Async class using Vertex AI Live API (one connection per request)
+  - `GeminiLiveSession` - **NEW**: Persistent session with continuous context updates
+  - `GeminiNarrator` - Sync wrapper (handles nested event loops)
   - `NarrationResult` - Dataclass with audio, transcript, and timing metrics
+  - `RateLimiter` - Sliding window rate limiter to prevent API abuse
   - Caching layer (TTL-based) for repeated scenes
+  - Semantic similarity for smart scene change detection
 
 - **`test_gemini_service.py`** - Test script with mock YOLO data
   - Tests async narrator, streaming, and sync wrapper
@@ -28,12 +31,12 @@ The Gemini Live API integration is **not yet working**. We've set up the infrast
 google-genai>=1.0.0
 python-dotenv>=1.0.0
 cachetools>=5.0.0
+sounddevice>=0.4.0  # For server-side audio playback
 ```
 
 ### Environment Variables (.env)
 
 ```
-GEMINI_API_KEY=<your-api-key>                    # For basic Gemini API (works)
 GOOGLE_APPLICATION_CREDENTIALS=./vertex-api-key.json  # For Vertex AI
 GOOGLE_CLOUD_PROJECT=<your-project-id>
 GOOGLE_CLOUD_LOCATION=us-central1
@@ -41,10 +44,13 @@ GOOGLE_CLOUD_LOCATION=us-central1
 
 ## Architecture
 
+### Per-Request Mode (GeminiLiveNarrator)
+
 ```
-YOLO Server (friend's piece)
+YOLO Server
     ↓ scene_analysis JSON + base64 image
 GeminiLiveNarrator
+    ├─ Rate limit check (10 calls/min default)
     ├─ Cache check (hash of summary + labels + image)
     │   └─ HIT: Return cached audio (<1ms)
     └─ MISS:
@@ -55,93 +61,136 @@ GeminiLiveNarrator
         └─ Return NarrationResult
 ```
 
-## What Works ✅
+### Persistent Session Mode (GeminiLiveSession) - RECOMMENDED
 
-1. **Basic Gemini API** (`gemini_test.py`)
-   - Text generation with `gemini-2.0-flash`
-   - Streaming responses
-   - Uses simple API key authentication
+```
+Server Startup
+    ↓
+GeminiLiveSession.connect()
+    ↓ (persistent WebSocket)
 
-2. **Service Structure**
-   - Caching mechanism (TTL-based, semantic keys)
-   - Image decoding (base64 with data URL prefix handling)
-   - Prompt building from YOLO scene_analysis
-   - WAV file export
+Frame 1 → update_context() → [no response, just feeds context]
+Frame 2 → update_context() → [no response]
+Frame 3 → update_context() → [no response]
+Frame 4 → process_frame() → similarity < 0.7 → request_narration() → Audio!
+Frame 5 → update_context() → [no response]
+...
+Frame N → EMERGENCY → request_narration() → Immediate Audio!
+...
+User asks "What's ahead?" → answer_question() → Audio response
+```
 
-## What's Broken ❌
+## Classes & API
 
-1. **Vertex AI Live API Connection**
-   - Model names keep changing/not being found
-   - Tried: `gemini-2.0-flash-exp`, `gemini-2.0-flash-live-001`, `gemini-live-2.5-flash-native-audio`
-   - Error: WebSocket connection closes with policy violation or model not found
+### GeminiLiveNarrator (Simple Mode)
+```python
+narrator = GeminiLiveNarrator(
+    model="gemini-live-2.5-flash-native-audio",
+    cache_ttl=30,
+    rate_limit_calls=10,
+    rate_limit_window=60.0
+)
+result = await narrator.narrate_with_image(scene_analysis, image_base64)
+```
 
-2. **Native Audio Model**
-   - `gemini-live-2.5-flash-native-audio` only outputs audio (no text)
-   - Need to configure `response_modalities=["AUDIO"]` correctly
+### GeminiLiveSession (Smart Mode)
+```python
+session = GeminiLiveSession(
+    min_narration_interval=5.0,  # Seconds between auto-narrations
+    rate_limit_calls=20,
+    rate_limit_window=60.0
+)
+await session.connect()
 
-## APIs Comparison
+# Main loop - call this for every frame
+result = await session.process_frame(scene_analysis, image_base64)
+if result:
+    play_audio(result.audio_data)
 
-| API | Auth | Live API | Latency | Setup |
-|-----|------|----------|---------|-------|
-| Google AI Studio | API Key | ❌ No | ~500ms | Easy |
-| Vertex AI | Service Account | ✅ Yes | ~100-300ms | Complex |
+# For user questions (when phone audio is ready)
+result = await session.answer_question(
+    question="What's in front of me?",
+    scene_analysis=current_scene,
+    image_base64=current_image
+)
+```
 
-We chose Vertex AI for the Live API's lower latency, but setup is more complex.
+### Smart Narration Logic
 
-## Next Steps
+| Trigger | Action |
+|---------|--------|
+| Emergency (vehicle close) | Immediate narration |
+| New object type appeared | Narrate |
+| Object moved far → close | Narrate |
+| Similarity < 0.7 + time > 5s | Narrate |
+| Similarity >= 0.7 | Skip (same scene) |
+| Time < 5s since last | Skip (throttled) |
 
-### Immediate (to get it working)
+### Semantic Similarity (`_scene_similarity`)
 
-1. **Verify Vertex AI API is enabled**
-   - Check Google Cloud Console → APIs & Services
-   - Ensure "Vertex AI API" is enabled (not just "Generative Language API")
+Instead of exact hash matching (which fails with real camera footage), we use semantic comparison:
 
-2. **Check service account permissions**
-   - Service account needs "Vertex AI User" role
-   - Verify JSON key is valid: `cat vertex-api-key.json`
+- Count objects by label (person: 2, chair: 3)
+- Count by (label, distance) tuples
+- Detect new object types → definitely narrate
+- Detect distance changes (far→close) → likely narrate
+- Weighted similarity score (0.0 = different, 1.0 = same)
 
-3. **Try different model names**
-   - Check available models: `client.models.list()`
-   - Look for models with "live" in the name
+Tunable: `session.similarity_threshold = 0.7`
 
-4. **Fallback: Use regular streaming API**
-   - If Live API doesn't work, use `generate_content_stream` with images
-   - Still fast (~500ms), works with basic API key
-   - Generate text, then use separate TTS (Google Cloud TTS or browser TTS)
+## Rate Limiting
 
-### Future Enhancements
+Built-in protection against API abuse:
 
-1. **Persistent WebSocket session**
-   - Keep connection open for continuous video stream
-   - Reduces per-frame connection overhead
+```python
+# Default: 10 calls per 60 seconds for GeminiLiveNarrator
+# Default: 20 calls per 60 seconds for GeminiLiveSession
 
-2. **Spatial Context Manager**
-   - Track user movement (turns, distance)
-   - Maintain scene memory
-   - Transform object positions based on movement
-   - Example: "The door you passed is now behind you on the left"
+# When rate limited, raises:
+RuntimeError("Rate limited. Try again in X.Xs")
+```
 
-3. **Smart narration throttling**
-   - Don't narrate every frame
-   - Only narrate on significant scene changes
-   - Emergency (vehicle nearby) = immediate narration
+Cache hits don't count against the rate limit.
 
-4. **Audio streaming to client**
-   - Stream audio chunks via Socket.IO as they arrive
-   - Client starts playback before full response
+## What Works
+
+1. **Vertex AI Live API** - Full audio generation working
+2. **Smart Narration** - Only speaks when scene changes significantly
+3. **Rate Limiting** - Prevents API abuse
+4. **Caching** - Repeated scenes return instantly
+5. **Sync Wrapper** - Works from both sync and async contexts
+6. **Server Audio Playback** - Testing via sounddevice
+
+## Pending / Future
+
+1. **Phone Audio Input** - `answer_question()` is ready, needs phone integration
+2. **LLM-based Narration Decision** - `_llm_should_narrate()` placeholder exists
+3. **Audio Streaming to Client** - Currently sends full audio after generation
+4. **Persistent Session in Server** - server.py still uses per-request mode
 
 ## Testing
 
 ```bash
-# Basic Gemini test (works)
-python gemini_test.py
-
-# Full service test (currently broken)
+# Full service test (working!)
 python test_gemini_service.py
 
 # With custom image
 python test_gemini_service.py /path/to/image.jpg
+
+# Play generated audio
+aplay test_output.wav
 ```
+
+## Cost Estimate
+
+For `gemini-live-2.5-flash-native-audio` on Vertex AI:
+
+| Usage | Estimated Cost |
+|-------|----------------|
+| 50 calls (~150s audio) | ~$0.04 - $0.10 |
+| 1000 calls | ~$1 - $2 |
+
+Flash models are cheap. Rate limiting is more about preventing spam than cost.
 
 ## Resources
 
@@ -149,10 +198,11 @@ python test_gemini_service.py /path/to/image.jpg
 - [Vertex AI vs AI Studio](https://ai.google.dev/gemini-api/docs/migrate-to-cloud)
 - [google-genai Python SDK](https://github.com/google/generative-ai-python)
 
-## Notes from Development Session
+## Notes from Development
 
 - The `google.generativeai` package is deprecated → use `google.genai`
 - Live API requires Vertex AI, not the basic Generative Language API
 - Vertex AI uses OAuth/service accounts, not simple API keys
-- Model naming is inconsistent between docs and actual API
-- Native audio models only output audio, not text (need transcription separately)
+- Model: `gemini-live-2.5-flash-native-audio` outputs audio only (no text transcript)
+- `asyncio.run()` can't be called from running loop → use ThreadPoolExecutor workaround
+- Exact scene hashing doesn't work with real camera footage → use semantic similarity

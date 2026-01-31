@@ -7,3 +7,8 @@ opencv-python==4.10.0.84
 numpy==1.26.4
 pillow==11.0.0
 python-multipart==0.0.20
+websocket-client>=1.8.0
+networkx==3.2.1
+
+# Test client dependencies
+colorama==0.4.6

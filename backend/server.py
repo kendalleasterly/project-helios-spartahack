@@ -11,8 +11,10 @@ from datetime import datetime, timezone
 from typing import List, Dict, Any
 
 import cv2
+import networkx as nx
 import numpy as np
 import socketio
+import torch
 import uvicorn
 from fastapi import FastAPI
 from PIL import Image
@@ -33,7 +35,8 @@ sio = socketio.AsyncServer(
     async_mode='asgi',
     cors_allowed_origins='*',  # Allow all origins for development
     logger=True,
-    engineio_logger=True
+    engineio_logger=True,
+    max_http_buffer_size=1e7
 )
 
 # Wrap with ASGI app
@@ -54,17 +57,42 @@ EMERGENCY_DISTANCES = {'immediate', 'close'}
 
 def load_yolo_model():
     """
-    Load YOLO11 Nano model at startup.
-    YOLO11 is chosen for its superior feature extraction accuracy
-    while maintaining easy integration with ultralytics library.
+    Load YOLO11 Extra Large model at startup with GPU acceleration.
+
+    YOLO11x (Extra Large) Configuration:
+    - Maximum feature extraction capability
+    - Highest recall for small/distant objects (lecture hall chairs)
+    - Optimized for RTX 4070 with 8GB VRAM
+    - Prioritizes detecting EVERYTHING over precision
     """
     global yolo_model
-    logger.info("Loading YOLO11 Nano model...")
+    logger.info("Loading YOLO11 Extra Large model (Maximum Recall Mode)...")
 
     try:
-        # ultralytics will auto-download yolo11n.pt if not present
-        yolo_model = YOLO('yolo11n.pt')
-        logger.info("✓ YOLO11 model loaded successfully")
+        # Check CUDA availability
+        if not torch.cuda.is_available():
+            logger.warning("⚠️  CUDA not available! Falling back to CPU (will be slow)")
+            device = 'cpu'
+        else:
+            device = 'cuda'
+            gpu_name = torch.cuda.get_device_name(0)
+            logger.info(f"✓ GPU Detected: {gpu_name}")
+
+        # Load YOLO11 Extra Large model (maximum recall)
+        # ultralytics will auto-download yolo11x.pt (~140MB) if not present
+        yolo_model = YOLO('yolo11x.pt')
+
+        # Move model to GPU
+        yolo_model.to(device)
+
+        logger.info(f"✓ YOLO11x (Extra Large) loaded successfully on {device.upper()}")
+
+        if device == 'cuda':
+            # Log VRAM usage
+            allocated = torch.cuda.memory_allocated(0) / 1024**3
+            logger.info(f"✓ GPU Memory Allocated: {allocated:.2f} GB")
+            logger.info(f"✓ Max Recall Mode: conf=0.05, iou=0.6")
+
     except Exception as e:
         logger.error(f"✗ Failed to load YOLO11 model: {e}")
         raise
@@ -186,6 +214,140 @@ def calculate_distance(bbox_height: float, image_height: int) -> str:
         return "far"
 
 
+def annotate_frame(image: np.ndarray, objects: List[Dict[str, Any]],
+                   emergency_stop: bool = False) -> np.ndarray:
+    """
+    Draw bounding boxes, labels, and 3x3 grid positions on the image for debugging.
+
+    Visual Coding:
+    - Green boxes: Safe objects (far distance)
+    - Yellow boxes: Close objects
+    - Red boxes: Immediate danger or emergency vehicles
+
+    Each box shows:
+    - Label + Confidence (e.g., "Person 95%")
+    - 3x3 Grid Position (e.g., "Mid-Center")
+    - Distance indicator
+
+    Args:
+        image: Original OpenCV image (BGR format)
+        objects: List of detected objects with positions and boxes
+        emergency_stop: Whether emergency was triggered
+
+    Returns:
+        np.ndarray: Annotated image
+    """
+    # Create a copy to avoid modifying original
+    annotated = image.copy()
+
+    # Add emergency banner if triggered
+    if emergency_stop:
+        # Draw red banner at top
+        cv2.rectangle(annotated, (0, 0), (image.shape[1], 50), (0, 0, 255), -1)
+        cv2.putText(
+            annotated,
+            "EMERGENCY: VEHICLE DETECTED",
+            (10, 35),
+            cv2.FONT_HERSHEY_BOLD,
+            1.2,
+            (255, 255, 255),
+            3
+        )
+
+    for obj in objects:
+        # Extract object data
+        label = obj.get('label', 'unknown')
+        confidence = obj.get('confidence', 0.0)
+        position = obj.get('position', 'unknown')
+        distance = obj.get('distance', 'unknown')
+        box = obj.get('box', [0, 0, 0, 0])
+
+        x1, y1, x2, y2 = box
+
+        # Color code by distance and emergency status
+        if distance == 'immediate':
+            color = (0, 0, 255)  # Red - BGR format
+            thickness = 3
+        elif distance == 'close':
+            color = (0, 165, 255)  # Orange
+            thickness = 2
+        else:
+            color = (0, 255, 0)  # Green
+            thickness = 2
+
+        # Override to red if it's a vehicle causing emergency
+        if label in VEHICLE_CLASSES and distance in EMERGENCY_DISTANCES:
+            color = (0, 0, 255)  # Red
+            thickness = 4
+
+        # Draw bounding box
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, thickness)
+
+        # Prepare label text
+        label_text = f"{label.capitalize()} {int(confidence * 100)}%"
+        position_text = position.replace('-', ' ').title()
+        distance_text = distance.upper()
+
+        # Calculate text position (above bounding box)
+        text_y = y1 - 10 if y1 - 10 > 20 else y1 + 20
+
+        # Draw label background for readability
+        (text_width, text_height), baseline = cv2.getTextSize(
+            label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2
+        )
+        cv2.rectangle(
+            annotated,
+            (x1, text_y - text_height - 5),
+            (x1 + text_width + 10, text_y + baseline),
+            color,
+            -1  # Filled rectangle
+        )
+
+        # Draw label text (white text on colored background)
+        cv2.putText(
+            annotated,
+            label_text,
+            (x1 + 5, text_y - 5),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            (255, 255, 255),  # White
+            2
+        )
+
+        # Draw position text below the box
+        position_y = y2 + 20
+        cv2.rectangle(
+            annotated,
+            (x1, position_y - 15),
+            (x1 + 150, position_y + 5),
+            (0, 0, 0),  # Black background
+            -1
+        )
+        cv2.putText(
+            annotated,
+            f"{position_text} | {distance_text}",
+            (x1 + 5, position_y),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (255, 255, 255),  # White
+            1
+        )
+
+    # Add object count in top-right corner
+    count_text = f"Objects: {len(objects)}"
+    cv2.putText(
+        annotated,
+        count_text,
+        (image.shape[1] - 150, 30),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.7,
+        (255, 255, 255),
+        2
+    )
+
+    return annotated
+
+
 def calculate_centroid(obj: Dict[str, Any]) -> tuple:
     """
     Calculate the centroid (center point) of a bounding box.
@@ -217,31 +379,36 @@ def euclidean_distance(point1: tuple, point2: tuple) -> float:
 
 
 def detect_crowd_clusters(objects: List[Dict[str, Any]],
-                         proximity_threshold: float = 150.0) -> List[Dict[str, Any]]:
+                         proximity_threshold: float = 200.0,
+                         image_width: int = 1280,
+                         image_height: int = 720) -> List[Dict[str, Any]]:
     """
-    Detect "crowd" clusters: 3+ objects of the same class within tight radius.
+    Graph-based "Mega-Clustering" using NetworkX Connected Components.
 
-    Clustering Algorithm:
-    1. Group objects by class label
-    2. For each group, calculate pairwise centroid distances
-    3. If 3+ objects are within proximity_threshold pixels, form a cluster
-    4. Use average position of cluster members
+    Algorithm (The "Mega-Cluster" Engine):
+    1. Build a graph G where each object is a node
+    2. Add edges between objects within proximity_threshold pixels
+    3. Find connected components (chain reactions: A→B→C merge into one cluster)
+    4. Analyze bounding box union of each component
+    5. Generate dynamic descriptions based on spatial coverage
 
-    Geometric Rationale:
-    - proximity_threshold of 150 pixels assumes ~640px image width
-    - Scales to roughly 25% of frame width (nearby objects)
-    - Prevents false clustering of distant objects
+    Mega-Cluster Logic:
+    - If cluster spans > 40% of image width → "Massive arrangement spanning [X] to [Y]"
+    - If cluster contains > 10 items → "Large group of [N] [Label]s"
+    - Refined spatial naming based on bounding box union coverage
 
     Args:
-        objects: List of detected objects
-        proximity_threshold: Max distance (pixels) for cluster membership
+        objects: List of detected objects with bounding boxes
+        proximity_threshold: Max distance (pixels) for edge creation (default 200px for lecture halls)
+        image_width: Width of the image (for spatial analysis)
+        image_height: Height of the image (for spatial analysis)
 
     Returns:
-        List of cluster metadata dicts
+        List of mega-cluster metadata dicts with dynamic descriptions
     """
     from collections import defaultdict
 
-    # Group objects by label
+    # Group objects by label (process each class separately)
     groups = defaultdict(list)
     for obj in objects:
         groups[obj['label']].append(obj)
@@ -250,46 +417,123 @@ def detect_crowd_clusters(objects: List[Dict[str, Any]],
 
     for label, group in groups.items():
         if len(group) < 3:
-            continue  # Need at least 3 for a "crowd"
+            continue  # Need at least 3 for a cluster
 
-        # Calculate all centroids
-        centroids = [calculate_centroid(obj) for obj in group]
+        # Step 1: Build a graph with objects as nodes
+        G = nx.Graph()
 
-        # Find tight clusters using simple proximity check
-        clustered_indices = set()
+        # Add all objects as nodes
+        for idx, obj in enumerate(group):
+            G.add_node(idx, obj=obj)
 
-        for i, centroid_i in enumerate(centroids):
-            if i in clustered_indices:
-                continue
+        # Step 2: Add edges between nearby objects (proximity-based connections)
+        for i, obj_i in enumerate(group):
+            centroid_i = calculate_centroid(obj_i)
 
-            # Find all objects within proximity
-            cluster_members = [i]
-            for j, centroid_j in enumerate(centroids):
-                if i != j and j not in clustered_indices:
+            for j, obj_j in enumerate(group):
+                if i < j:  # Avoid duplicate edges
+                    centroid_j = calculate_centroid(obj_j)
                     dist = euclidean_distance(centroid_i, centroid_j)
+
                     if dist < proximity_threshold:
-                        cluster_members.append(j)
+                        G.add_edge(i, j)
 
-            # If we found a crowd (3+), create cluster
-            if len(cluster_members) >= 3:
-                clustered_indices.update(cluster_members)
+        # Step 3: Find connected components (mega-clusters via chain reactions)
+        components = list(nx.connected_components(G))
 
-                # Calculate average position
-                avg_x = np.mean([centroids[idx][0] for idx in cluster_members])
-                avg_y = np.mean([centroids[idx][1] for idx in cluster_members])
+        for component in components:
+            if len(component) < 3:
+                continue  # Still need at least 3 for a cluster
 
-                # Get average grid position from members
-                positions = [group[idx]['position'] for idx in cluster_members]
-                # Use most common position or first one
-                avg_position = max(set(positions), key=positions.count)
+            # Get all objects in this mega-cluster
+            cluster_objects = [group[idx] for idx in component]
 
-                clusters.append({
-                    'type': 'crowd',
-                    'label': label,
-                    'count': len(cluster_members),
-                    'position': avg_position,
-                    'centroid': (avg_x, avg_y)
-                })
+            # Step 4: Calculate bounding box union (min_x, min_y, max_x, max_y)
+            all_boxes = [obj['box'] for obj in cluster_objects]
+            min_x = min(box[0] for box in all_boxes)
+            min_y = min(box[1] for box in all_boxes)
+            max_x = max(box[2] for box in all_boxes)
+            max_y = max(box[3] for box in all_boxes)
+
+            # Calculate union box dimensions and coverage
+            union_width = max_x - min_x
+            union_height = max_y - min_y
+            width_coverage = union_width / image_width  # Fraction of image width
+            height_coverage = union_height / image_height
+
+            # Step 5: Determine spatial zones covered by the union box
+            # Calculate center of union box for primary position
+            union_center_x = (min_x + max_x) / 2
+            union_center_y = (min_y + max_y) / 2
+
+            # Determine which horizontal zones are covered
+            left_edge = min_x / image_width
+            right_edge = max_x / image_width
+
+            zones_covered = []
+            if left_edge < 0.33:
+                zones_covered.append("left")
+            if left_edge < 0.66 and right_edge > 0.33:
+                zones_covered.append("center")
+            if right_edge > 0.66:
+                zones_covered.append("right")
+
+            # Determine vertical coverage
+            top_edge = min_y / image_height
+            bottom_edge = max_y / image_height
+
+            vertical_zones = []
+            if top_edge < 0.33:
+                vertical_zones.append("top")
+            if top_edge < 0.66 and bottom_edge > 0.33:
+                vertical_zones.append("mid")
+            if bottom_edge > 0.66:
+                vertical_zones.append("bottom")
+
+            # Build spatial description
+            if len(zones_covered) >= 2:
+                # Spans multiple horizontal zones
+                span_description = f"from {zones_covered[0]} to {zones_covered[-1]}"
+            else:
+                span_description = zones_covered[0] if zones_covered else "center"
+
+            # Add vertical context if it spans multiple zones
+            if len(vertical_zones) >= 2:
+                vertical_description = f"{vertical_zones[0]} to {vertical_zones[-1]}"
+            else:
+                vertical_description = vertical_zones[0] if vertical_zones else "mid"
+
+            # Step 6: Generate dynamic cluster description
+            count = len(component)
+
+            # Determine cluster type based on size and coverage
+            if width_coverage > 0.4:
+                # Massive arrangement spanning significant portion of frame
+                cluster_type = 'massive_arrangement'
+                description = f"spanning {span_description}"
+            elif count > 10:
+                # Large group
+                cluster_type = 'large_group'
+                description = f"taking up the {span_description}"
+            else:
+                # Dense cluster (default)
+                cluster_type = 'crowd'
+                # Combine vertical and horizontal for precise location
+                if len(zones_covered) == 1 and len(vertical_zones) == 1:
+                    description = f"{vertical_description} {span_description}"
+                else:
+                    description = f"covering {vertical_description} {span_description}"
+
+            clusters.append({
+                'type': cluster_type,
+                'label': label,
+                'count': count,
+                'description': description,
+                'width_coverage': width_coverage,
+                'height_coverage': height_coverage,
+                'bounding_box': [min_x, min_y, max_x, max_y],
+                'centroid': (union_center_x, union_center_y)
+            })
 
     return clusters
 
@@ -510,8 +754,13 @@ def process_detections(results, image_height: int, image_width: int) -> Dict[str
                     f"⚠️  EMERGENCY: {label} detected at {distance} distance ({position})"
                 )
 
-    # Step 2: Detect geometric patterns (crowds, rows, stacks)
-    crowd_clusters = detect_crowd_clusters(objects)
+    # Step 2: Detect geometric patterns using NetworkX mega-clustering
+    crowd_clusters = detect_crowd_clusters(
+        objects,
+        proximity_threshold=200.0,  # Generous threshold for lecture hall rows
+        image_width=image_width,
+        image_height=image_height
+    )
     row_patterns = detect_row_patterns(objects)
     stack_patterns = detect_stack_patterns(objects)
 
@@ -534,22 +783,19 @@ def generate_summary(objects: List[Dict[str, Any]],
     """
     Generate sophisticated natural language scene description for LLM.
 
-    Natural Language Generation Strategy:
-    1. Prioritize clusters (crowds, rows, stacks) over individual objects
-    2. Use descriptive phrases instead of CSV format
-    3. Mention spatial relationships and arrangements
-    4. Keep it concise but informative (2-3 sentences max)
+    Enhanced Mega-Cluster Strategy:
+    1. Prioritize mega-clusters (massive arrangements, large groups) over individual objects
+    2. Use dynamic descriptions based on spatial coverage and count
+    3. Avoid fragmented descriptions - merge connected objects into cohesive narratives
+    4. Keep it concise but informative
 
     Examples:
-    - BAD:  "Chair (Left), Chair (Center), Person (Right)"
-    - GOOD: "A row of empty chairs spanning left to center, with a person standing to the right."
-
-    - BAD:  "Person (Center), Person (Center), Person (Center)"
-    - GOOD: "A dense cluster of 3 people gathered in the center of the frame."
+    - OLD: "A dense cluster of 3 chairs (mid left), a dense cluster of 3 chairs (mid left)..."
+    - NEW: "A massive arrangement of 65 chairs spanning from left to right across the lecture hall."
 
     Args:
         objects: List of detected objects with 3x3 grid positions
-        clusters: List of detected geometric patterns (crowds, rows, stacks)
+        clusters: List of mega-cluster metadata from NetworkX analysis
 
     Returns:
         str: Natural language scene description
@@ -561,31 +807,43 @@ def generate_summary(objects: List[Dict[str, Any]],
     clustered_labels = set()
     summary_parts = []
 
-    # Step 1: Describe clusters first (higher priority)
+    # Step 1: Describe mega-clusters first (highest priority)
     for cluster in clusters:
         label = cluster.get('label', 'object')
         count = cluster.get('count', 0)
         cluster_type = cluster.get('type', 'unknown')
+        description = cluster.get('description', 'in the frame')
 
         # Pluralize label
         plural_label = label + 's' if not label.endswith('s') else label
 
-        if cluster_type == 'crowd':
-            # Safe get for position with fallback
-            pos = cluster.get('position', 'mid-center').replace('-', ' ')
+        if cluster_type == 'massive_arrangement':
+            # Massive arrangements spanning significant portions of frame
             summary_parts.append(
-                f"a dense cluster of {count} {plural_label} ({pos})"
+                f"a massive arrangement of {count} {plural_label} {description}"
+            )
+
+        elif cluster_type == 'large_group':
+            # Large groups (10+ items)
+            summary_parts.append(
+                f"a large group of {count} {plural_label} {description}"
+            )
+
+        elif cluster_type == 'crowd':
+            # Dense clusters (3-10 items)
+            summary_parts.append(
+                f"a cluster of {count} {plural_label} ({description})"
             )
 
         elif cluster_type == 'row':
-            # Safe get for span with fallback
+            # Row patterns (legacy support for row detection if still used)
             span = cluster.get('span', 'across the frame')
             summary_parts.append(
                 f"a row of {count} {plural_label} spanning from {span}"
             )
 
         elif cluster_type == 'stack':
-            # Safe get for position with fallback
+            # Stack patterns (legacy support for stack detection if still used)
             pos = cluster.get('position', 'center')
             summary_parts.append(
                 f"a stack of {count} {plural_label} ({pos} side)"
@@ -718,14 +976,31 @@ async def video_frame(sid, data):
             return
 
         base64_frame = data['frame']
+        debug_mode = data.get('debug', False)  # Check for debug flag
 
         # Step 1: Decode Base64 image
         image = decode_base64_image(base64_frame)
         image_height, image_width = image.shape[:2]
-        logger.info(f"📷 Received frame: {image_width}x{image_height}")
+        logger.info(f"📷 Received frame: {image_width}x{image_height} (Debug: {debug_mode})")
 
-        # Step 2: Run YOLO11 inference
-        results = yolo_model(image, verbose=False)
+        # Step 2: Run YOLO11x inference with MAXIMUM RECALL settings
+        # Use torch.no_grad() to disable gradient computation (saves VRAM)
+        inference_start = asyncio.get_event_loop().time()
+
+        with torch.no_grad():
+            results = yolo_model(
+                image,
+                verbose=False,
+                conf=0.05,      # Ultra-low confidence: detect EVERYTHING (even 5% probability)
+                iou=0.6,        # Relaxed NMS: allow overlapping objects (row of chairs)
+                imgsz=1280      # High resolution for distant objects
+            )
+
+        # Calculate inference time in milliseconds
+        inference_end = asyncio.get_event_loop().time()
+        inference_ms = (inference_end - inference_start) * 1000
+
+        logger.info(f"⚡ Inference: {inference_ms:.2f}ms")
 
         # Step 3: Convert to semantic spatial data with clustering
         detection_data = process_detections(results, image_height, image_width)
@@ -741,13 +1016,28 @@ async def video_frame(sid, data):
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "emergency_stop": emergency_stop,
             "summary": summary,
-            "objects": objects
+            "objects": objects,
+            "inference_ms": round(inference_ms, 2)  # GPU inference time for telemetry
         }
 
-        # Calculate processing time
+        # Step 5: Add debug visualization if requested
+        if debug_mode:
+            logger.info("🎨 Generating annotated debug frame...")
+            annotated_image = annotate_frame(image, objects, emergency_stop)
+
+            # Encode annotated image back to Base64
+            _, buffer = cv2.imencode('.jpg', annotated_image)
+            debug_base64 = base64.b64encode(buffer).decode('utf-8')
+            debug_data_url = f"data:image/jpeg;base64,{debug_base64}"
+
+            # Add to response
+            response['debug_frame'] = debug_data_url
+            logger.info("✓ Debug frame included in response")
+
+        # Calculate total processing time
         processing_time = (asyncio.get_event_loop().time() - start_time) * 1000
         logger.info(
-            f"✓ Processed in {processing_time:.1f}ms | "
+            f"✓ Total: {processing_time:.1f}ms (Inference: {inference_ms:.1f}ms) | "
             f"Objects: {len(objects)} | Emergency: {emergency_stop}"
         )
 

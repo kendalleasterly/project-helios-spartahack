@@ -7,8 +7,11 @@ import asyncio
 import base64
 import io
 import logging
+import os
+import uuid
 from datetime import datetime, timezone
-from typing import List, Dict, Any
+from pathlib import Path
+from typing import List, Dict, Any, Optional
 
 import cv2
 import networkx as nx
@@ -16,9 +19,13 @@ import numpy as np
 import socketio
 import torch
 import uvicorn
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from PIL import Image
 from ultralytics import YOLO
+
+# Load environment variables
+load_dotenv()
 
 # Configure logging
 logging.basicConfig(
@@ -34,8 +41,8 @@ app = FastAPI(title="YOLO11 Vision Server")
 sio = socketio.AsyncServer(
     async_mode='asgi',
     cors_allowed_origins='*',  # Allow all origins for development
-    logger=True,
-    engineio_logger=True,
+    logger=False,
+    engineio_logger=False,
     max_http_buffer_size=1e7
 )
 
@@ -53,6 +60,10 @@ VEHICLE_CLASSES = {'car', 'bus', 'truck', 'motorcycle', 'bicycle'}
 
 # Emergency distance thresholds
 EMERGENCY_DISTANCES = {'immediate', 'close'}
+
+# Debug Recording Configuration
+SAVE_DEBUG_FRAMES = os.getenv('SAVE_DEBUG_FRAMES', 'true').lower() == 'true'
+DEBUG_OUTPUT_DIR = Path('server_debug_output')
 
 
 def load_yolo_model():
@@ -912,10 +923,80 @@ def generate_summary(objects: List[Dict[str, Any]],
         return f"{main_part.capitalize()}, and {last_part}."
 
 
+def prepare_gemini_input(image: np.ndarray, summary: str, emergency_stop: bool) -> Dict[str, Any]:
+    """
+    Prepare input data for Gemini LLM integration.
+
+    This function packages the original image and YOLO detection summary
+    for passing to Gemini for natural language processing and response generation.
+
+    Args:
+        image: Original BGR image from OpenCV (numpy array)
+        summary: Natural language description of detected objects/clusters
+        emergency_stop: Whether an emergency condition was detected
+
+    Returns:
+        Dict containing:
+            - image_rgb: RGB PIL Image (Gemini-compatible format)
+            - summary: Natural language YOLO summary
+            - emergency_stop: Emergency flag
+            - timestamp: ISO timestamp
+    """
+    # Convert BGR (OpenCV) to RGB (PIL/Gemini format)
+    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    pil_image = Image.fromarray(image_rgb)
+
+    return {
+        "image": pil_image,  # PIL Image in RGB format
+        "summary": summary,  # Natural language YOLO summary
+        "emergency_stop": emergency_stop,  # Emergency flag for urgent responses
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+
+async def call_gemini(gemini_input: Dict[str, Any]) -> Optional[str]:
+    """
+    Placeholder for Gemini API integration.
+
+    TODO: Implement Gemini API call here
+    - Use gemini_input['image'] (PIL Image) for visual context
+    - Use gemini_input['summary'] (str) for YOLO detection context
+    - Use gemini_input['emergency_stop'] (bool) to prioritize urgent responses
+
+    Args:
+        gemini_input: Prepared input from prepare_gemini_input()
+
+    Returns:
+        Gemini's natural language response (str) or None if not implemented
+    """
+    # TODO: Add Gemini API implementation here
+    # Example structure:
+    # import google.generativeai as genai
+    # genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+    # model = genai.GenerativeModel('gemini-2.0-flash-exp')
+    # response = model.generate_content([
+    #     gemini_input['image'],
+    #     f"Scene Analysis: {gemini_input['summary']}"
+    # ])
+    # return response.text
+
+    logger.info("📋 Gemini input prepared (API not yet implemented)")
+    logger.info(f"   Summary: {gemini_input['summary']}")
+    logger.info(f"   Emergency: {gemini_input['emergency_stop']}")
+    return None
+
+
 @app.on_event("startup")
 async def startup_event():
-    """Load YOLO model when server starts."""
+    """Load YOLO model and setup debug output directory when server starts."""
     load_yolo_model()
+
+    # Setup debug output directory
+    if SAVE_DEBUG_FRAMES:
+        DEBUG_OUTPUT_DIR.mkdir(exist_ok=True)
+        logger.info(f"💾 Debug frame recording ENABLED → {DEBUG_OUTPUT_DIR.absolute()}")
+    else:
+        logger.info("💾 Debug frame recording DISABLED")
 
 
 @app.get("/")
@@ -987,13 +1068,17 @@ async def video_frame(sid, data):
         # Use torch.no_grad() to disable gradient computation (saves VRAM)
         inference_start = asyncio.get_event_loop().time()
 
+        NAV_CLASSES = [0, 13, 24, 39, 41, 42, 43, 44, 45, 56, 57, 62, 63, 64, 65, 66, 67, 73] 
+
         with torch.no_grad():
             results = yolo_model(
                 image,
                 verbose=False,
-                conf=0.05,      # Ultra-low confidence: detect EVERYTHING (even 5% probability)
-                iou=0.6,        # Relaxed NMS: allow overlapping objects (row of chairs)
-                imgsz=1280      # High resolution for distant objects
+                conf=0.25,        # Raised from 0.05. Only report if 25% sure.
+                iou=0.45,         # Lowered from 0.6. Aggressively merge duplicate boxes.
+                imgsz=1280,       # Keep high res for small objects.
+                classes=NAV_CLASSES, # <--- CRITICAL: Ignore everything else (fridges, etc).
+                agnostic_nms=True # Prevents a "chair" box from overlapping a "bench" box.
             )
 
         # Calculate inference time in milliseconds
@@ -1042,10 +1127,37 @@ async def video_frame(sid, data):
         )
         logger.info(f"📝 Natural Language Summary: {summary}")
 
-        # NOTE: Not sending response to mobile client yet
-        # The natural language summary is being prepared for Gemini integration
-        # Once Gemini is implemented, it will use the 'summary' field for context
-        # await sio.emit('scene_analysis', response, room=sid)  # Disabled for now
+        # Step 5.5: Server-Side Debug Recording (Save annotated frames to disk)
+        if SAVE_DEBUG_FRAMES:
+            try:
+                # Generate annotated frame with all detections
+                annotated_debug = annotate_frame(image, objects, emergency_stop)
+
+                # Generate unique filename with timestamp and UUID
+                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+                unique_id = str(uuid.uuid4())[:8]
+                filename = f"frame_{timestamp}_{unique_id}.jpg"
+                filepath = DEBUG_OUTPUT_DIR / filename
+
+                # Save to disk
+                cv2.imwrite(str(filepath), annotated_debug)
+                logger.info(f"💾 Saved debug frame: {filename}")
+
+            except Exception as disk_error:
+                # Don't crash the websocket if disk I/O fails
+                logger.error(f"⚠️  Failed to save debug frame: {disk_error}")
+
+        # Step 6: Prepare input for Gemini and call the LLM
+        gemini_input = prepare_gemini_input(image, summary, emergency_stop)
+        gemini_response = await call_gemini(gemini_input)
+
+        # TODO: Once Gemini is implemented, send gemini_response back to mobile client
+        # if gemini_response:
+        #     await sio.emit('assistant_response', {
+        #         'response': gemini_response,
+        #         'emergency': emergency_stop,
+        #         'timestamp': gemini_input['timestamp']
+        #     }, room=sid)
 
     except Exception as e:
         logger.error(f"Error processing video frame: {e}", exc_info=True)

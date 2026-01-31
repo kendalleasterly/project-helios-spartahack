@@ -1040,9 +1040,12 @@ async def video_frame(sid, data):
             f"✓ Total: {processing_time:.1f}ms (Inference: {inference_ms:.1f}ms) | "
             f"Objects: {len(objects)} | Emergency: {emergency_stop}"
         )
+        logger.info(f"📝 Natural Language Summary: {summary}")
 
-        # Emit result back to client
-        await sio.emit('scene_analysis', response, room=sid)
+        # NOTE: Not sending response to mobile client yet
+        # The natural language summary is being prepared for Gemini integration
+        # Once Gemini is implemented, it will use the 'summary' field for context
+        # await sio.emit('scene_analysis', response, room=sid)  # Disabled for now
 
     except Exception as e:
         logger.error(f"Error processing video frame: {e}", exc_info=True)

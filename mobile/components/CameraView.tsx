@@ -1,6 +1,8 @@
 import { useEffect, useState, useRef, useCallback } from 'react';
 import { StyleSheet, View, Text, ActivityIndicator } from 'react-native';
 import { Camera, useCameraDevice, useCameraPermission } from 'react-native-vision-camera';
+import { useWebSocket } from '../hooks/useWebSocket';
+import ConnectionStatus from './ConnectionStatus';
 
 const FRAME_RATE = 1;
 
@@ -10,6 +12,7 @@ export default function CameraView() {
   const device = useCameraDevice('back');
   const camera = useRef<Camera>(null);
   const captureInterval = useRef<ReturnType<typeof setInterval> | null>(null);
+  const { status, sendFrame, connect } = useWebSocket();
 
   const captureFrame = useCallback(async () => {
     if (camera.current == null) return;
@@ -27,13 +30,15 @@ export default function CameraView() {
         const base64 = reader.result as string;
         const base64Data = base64.split(',')[1];
         console.log(`Frame captured: ${photo.width}x${photo.height}, base64 JPEG length: ${base64Data.length}`);
+
+        sendFrame(base64Data);
       };
 
       reader.readAsDataURL(blob);
     } catch (error) {
       console.error('Error capturing frame:', error);
     }
-  }, []);
+  }, [sendFrame]);
 
   useEffect(() => {
     if (hasPermission === false) {
@@ -43,10 +48,11 @@ export default function CameraView() {
 
   useEffect(() => {
     setIsActive(true);
+    connect();
     return () => {
       setIsActive(false);
     };
-  }, []);
+  }, [connect]);
 
   useEffect(() => {
     if (isActive && hasPermission && device != null) {
@@ -98,6 +104,7 @@ export default function CameraView() {
         isActive={isActive}
         photo={true}
       />
+      <ConnectionStatus status={status} />
     </View>
   );
 }

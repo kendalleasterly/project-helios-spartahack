@@ -1,0 +1,95 @@
+import { useEffect, useRef, useState, useCallback } from 'react';
+import { io, Socket } from 'socket.io-client';
+
+// TODO: this is the local IP of the windows laptop running its hotspot as the network for the mobile device
+// Find your laptop IP:
+const SERVER_URL = 'http://192.168.137.1:8000';
+
+export type ConnectionStatus = 'disconnected' | 'connecting' | 'connected' | 'error';
+
+interface UseWebSocketReturn {
+  socket: Socket | null;
+  status: ConnectionStatus;
+  sendFrame: (base64Frame: string, debug?: boolean) => void;
+  connect: () => void;
+  disconnect: () => void;
+}
+
+export function useWebSocket(): UseWebSocketReturn {
+  const [status, setStatus] = useState<ConnectionStatus>('disconnected');
+  const socketRef = useRef<Socket | null>(null);
+
+  const connect = useCallback(() => {
+    if (socketRef.current?.connected) {
+      return;
+    }
+
+    setStatus('connecting');
+
+    const socket = io(SERVER_URL, {
+      transports: ['websocket'],
+      reconnection: true,
+      reconnectionDelay: 1000,
+      reconnectionDelayMax: 5000,
+      reconnectionAttempts: 5,
+    });
+
+    socket.on('connect', () => {
+      console.log('WebSocket connected');
+      setStatus('connected');
+    });
+
+    socket.on('connection_established', (data) => {
+      console.log('Connection established:', data);
+    });
+
+    socket.on('disconnect', (reason) => {
+      console.log('WebSocket disconnected:', reason);
+      setStatus('disconnected');
+    });
+
+    socket.on('connect_error', (error) => {
+      console.error('WebSocket connection error:', error);
+      setStatus('error');
+    });
+
+    socket.on('error', (error) => {
+      console.error('WebSocket error:', error);
+    });
+
+    socketRef.current = socket;
+  }, []);
+
+  const disconnect = useCallback(() => {
+    if (socketRef.current) {
+      socketRef.current.disconnect();
+      socketRef.current = null;
+      setStatus('disconnected');
+    }
+  }, []);
+
+  const sendFrame = useCallback((base64Frame: string, debug = false) => {
+    if (socketRef.current?.connected) {
+      socketRef.current.emit('video_frame', {
+        frame: base64Frame,
+        debug,
+      });
+    } else {
+      console.warn('Cannot send frame: WebSocket not connected');
+    }
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      disconnect();
+    };
+  }, [disconnect]);
+
+  return {
+    socket: socketRef.current,
+    status,
+    sendFrame,
+    connect,
+    disconnect,
+  };
+}

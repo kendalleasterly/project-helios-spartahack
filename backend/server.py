@@ -1,0 +1,775 @@
+"""
+YOLO11 Vision Processing Server for Blind Assistant
+Receives video frames via Socket.IO, processes with YOLO11, returns semantic spatial data
+"""
+
+import asyncio
+import base64
+import io
+import logging
+from datetime import datetime, timezone
+from typing import List, Dict, Any
+
+import cv2
+import numpy as np
+import socketio
+import uvicorn
+from fastapi import FastAPI
+from PIL import Image
+from ultralytics import YOLO
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Initialize FastAPI app
+app = FastAPI(title="YOLO11 Vision Server")
+
+# Initialize Socket.IO with CORS enabled
+sio = socketio.AsyncServer(
+    async_mode='asgi',
+    cors_allowed_origins='*',  # Allow all origins for development
+    logger=True,
+    engineio_logger=True
+)
+
+# Wrap with ASGI app
+socket_app = socketio.ASGIApp(
+    socketio_server=sio,
+    other_asgi_app=app
+)
+
+# Global YOLO model (loaded at startup)
+yolo_model = None
+
+# Vehicle classes that trigger emergency warnings
+VEHICLE_CLASSES = {'car', 'bus', 'truck', 'motorcycle', 'bicycle'}
+
+# Emergency distance thresholds
+EMERGENCY_DISTANCES = {'immediate', 'close'}
+
+
+def load_yolo_model():
+    """
+    Load YOLO11 Nano model at startup.
+    YOLO11 is chosen for its superior feature extraction accuracy
+    while maintaining easy integration with ultralytics library.
+    """
+    global yolo_model
+    logger.info("Loading YOLO11 Nano model...")
+
+    try:
+        # ultralytics will auto-download yolo11n.pt if not present
+        yolo_model = YOLO('yolo11n.pt')
+        logger.info("✓ YOLO11 model loaded successfully")
+    except Exception as e:
+        logger.error(f"✗ Failed to load YOLO11 model: {e}")
+        raise
+
+
+def decode_base64_image(base64_string: str) -> np.ndarray:
+    """
+    Decode a Base64 encoded JPEG image to OpenCV format (BGR).
+
+    Args:
+        base64_string: Base64 encoded image string
+
+    Returns:
+        numpy.ndarray: Image in OpenCV BGR format
+    """
+    try:
+        # Remove data URL prefix if present (e.g., "data:image/jpeg;base64,")
+        if ',' in base64_string:
+            base64_string = base64_string.split(',', 1)[1]
+
+        # Decode base64 to bytes
+        image_bytes = base64.b64decode(base64_string)
+
+        # Convert to PIL Image then to OpenCV format
+        pil_image = Image.open(io.BytesIO(image_bytes))
+        opencv_image = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+
+        return opencv_image
+    except Exception as e:
+        logger.error(f"Error decoding base64 image: {e}")
+        raise
+
+
+def calculate_3x3_position(bbox_center_x: float, bbox_center_y: float,
+                           image_width: int, image_height: int) -> str:
+    """
+    Determine position in a 3x3 grid system for high-fidelity spatial awareness.
+
+    3x3 Grid Spatial Logic:
+
+    X-Axis (Horizontal):
+    - Left:   0% - 33% of image width
+    - Center: 33% - 66% of image width
+    - Right:  66% - 100% of image width
+
+    Y-Axis (Vertical):
+    - Top:    0% - 33% of image height (sky, ceiling, signs)
+    - Middle: 33% - 66% of image height (eye-level, torso)
+    - Bottom: 66% - 100% of image height (floor, curbs, ground objects)
+
+    Combined Output Examples:
+    - "top-left", "top-center", "top-right"
+    - "mid-left", "mid-center", "mid-right"
+    - "bottom-left", "bottom-center", "bottom-right"
+
+    Why This Matters:
+    A "Chandelier" at top-center vs "Carpet" at bottom-center are critically
+    different for navigation. Vertical awareness prevents collisions with
+    overhead obstacles and low-lying trip hazards.
+
+    Args:
+        bbox_center_x: X-coordinate of bounding box center
+        bbox_center_y: Y-coordinate of bounding box center
+        image_width: Total width of the image
+        image_height: Total height of the image
+
+    Returns:
+        str: Grid position like "top-left", "mid-center", "bottom-right"
+    """
+    # Calculate relative positions (0.0 to 1.0)
+    relative_x = bbox_center_x / image_width
+    relative_y = bbox_center_y / image_height
+
+    # Determine horizontal zone
+    if relative_x < 0.33:
+        horizontal = "left"
+    elif relative_x < 0.66:
+        horizontal = "center"
+    else:
+        horizontal = "right"
+
+    # Determine vertical zone
+    if relative_y < 0.33:
+        vertical = "top"
+    elif relative_y < 0.66:
+        vertical = "mid"
+    else:
+        vertical = "bottom"
+
+    # Combine into grid position
+    return f"{vertical}-{horizontal}"
+
+
+def calculate_distance(bbox_height: float, image_height: int) -> str:
+    """
+    Estimate object distance based on bounding box height.
+
+    Distance Logic (Depth Estimation):
+    - Immediate: Box height > 50% of image height (RIGHT IN FRONT)
+    - Close:     Box height > 20% of image height
+    - Far:       Box height ≤ 20% of image height
+
+    Rationale: Larger objects in the frame are closer to the camera.
+
+    Args:
+        bbox_height: Height of the bounding box
+        image_height: Total height of the image
+
+    Returns:
+        str: "immediate", "close", or "far"
+    """
+    relative_height = bbox_height / image_height
+
+    if relative_height > 0.50:
+        return "immediate"
+    elif relative_height > 0.20:
+        return "close"
+    else:
+        return "far"
+
+
+def calculate_centroid(obj: Dict[str, Any]) -> tuple:
+    """
+    Calculate the centroid (center point) of a bounding box.
+
+    Args:
+        obj: Object dict with 'box' field [x1, y1, x2, y2]
+
+    Returns:
+        tuple: (center_x, center_y)
+    """
+    x1, y1, x2, y2 = obj['box']
+    return ((x1 + x2) / 2, (y1 + y2) / 2)
+
+
+def euclidean_distance(point1: tuple, point2: tuple) -> float:
+    """
+    Calculate Euclidean distance between two points.
+
+    Formula: sqrt((x2 - x1)^2 + (y2 - y1)^2)
+
+    Args:
+        point1: (x1, y1)
+        point2: (x2, y2)
+
+    Returns:
+        float: Distance in pixels
+    """
+    return np.sqrt((point2[0] - point1[0])**2 + (point2[1] - point1[1])**2)
+
+
+def detect_crowd_clusters(objects: List[Dict[str, Any]],
+                         proximity_threshold: float = 150.0) -> List[Dict[str, Any]]:
+    """
+    Detect "crowd" clusters: 3+ objects of the same class within tight radius.
+
+    Clustering Algorithm:
+    1. Group objects by class label
+    2. For each group, calculate pairwise centroid distances
+    3. If 3+ objects are within proximity_threshold pixels, form a cluster
+    4. Use average position of cluster members
+
+    Geometric Rationale:
+    - proximity_threshold of 150 pixels assumes ~640px image width
+    - Scales to roughly 25% of frame width (nearby objects)
+    - Prevents false clustering of distant objects
+
+    Args:
+        objects: List of detected objects
+        proximity_threshold: Max distance (pixels) for cluster membership
+
+    Returns:
+        List of cluster metadata dicts
+    """
+    from collections import defaultdict
+
+    # Group objects by label
+    groups = defaultdict(list)
+    for obj in objects:
+        groups[obj['label']].append(obj)
+
+    clusters = []
+
+    for label, group in groups.items():
+        if len(group) < 3:
+            continue  # Need at least 3 for a "crowd"
+
+        # Calculate all centroids
+        centroids = [calculate_centroid(obj) for obj in group]
+
+        # Find tight clusters using simple proximity check
+        clustered_indices = set()
+
+        for i, centroid_i in enumerate(centroids):
+            if i in clustered_indices:
+                continue
+
+            # Find all objects within proximity
+            cluster_members = [i]
+            for j, centroid_j in enumerate(centroids):
+                if i != j and j not in clustered_indices:
+                    dist = euclidean_distance(centroid_i, centroid_j)
+                    if dist < proximity_threshold:
+                        cluster_members.append(j)
+
+            # If we found a crowd (3+), create cluster
+            if len(cluster_members) >= 3:
+                clustered_indices.update(cluster_members)
+
+                # Calculate average position
+                avg_x = np.mean([centroids[idx][0] for idx in cluster_members])
+                avg_y = np.mean([centroids[idx][1] for idx in cluster_members])
+
+                # Get average grid position from members
+                positions = [group[idx]['position'] for idx in cluster_members]
+                # Use most common position or first one
+                avg_position = max(set(positions), key=positions.count)
+
+                clusters.append({
+                    'type': 'crowd',
+                    'label': label,
+                    'count': len(cluster_members),
+                    'position': avg_position,
+                    'centroid': (avg_x, avg_y)
+                })
+
+    return clusters
+
+
+def detect_row_patterns(objects: List[Dict[str, Any]],
+                       y_tolerance: float = 50.0,
+                       min_count: int = 3) -> List[Dict[str, Any]]:
+    """
+    Detect horizontal "row" patterns: 3+ objects aligned horizontally.
+
+    Row Detection Algorithm:
+    1. Group objects by class label
+    2. Calculate Y-coordinate variance (vertical spread)
+    3. If variance is LOW (similar Y) but X-spread is HIGH → it's a row
+    4. Extract leftmost and rightmost positions for description
+
+    Geometric Math:
+    - y_tolerance = 50px means centroids must be within 50px vertically
+    - This accounts for slight misalignments in real-world scenes
+    - X-spread measures horizontal span (left-to-right extent)
+
+    Example: "A row of 4 chairs spanning from left to center"
+
+    Args:
+        objects: List of detected objects
+        y_tolerance: Max Y-coordinate variance for row detection (pixels)
+        min_count: Minimum objects to form a row
+
+    Returns:
+        List of row pattern metadata dicts
+    """
+    from collections import defaultdict
+
+    groups = defaultdict(list)
+    for obj in objects:
+        groups[obj['label']].append(obj)
+
+    rows = []
+
+    for label, group in groups.items():
+        if len(group) < min_count:
+            continue
+
+        # Calculate centroids and Y-coordinates
+        centroids = [calculate_centroid(obj) for obj in group]
+        y_coords = [c[1] for c in centroids]
+        x_coords = [c[0] for c in centroids]
+
+        # Check if Y-variance is low (horizontally aligned)
+        y_variance = np.var(y_coords)
+        x_spread = max(x_coords) - min(x_coords)
+
+        # Row criteria: low Y-variance, high X-spread
+        if y_variance < (y_tolerance ** 2) and x_spread > 200:
+            # Determine span (leftmost to rightmost position)
+            positions = [obj['position'] for obj in group]
+            leftmost = min(x_coords)
+            rightmost = max(x_coords)
+
+            # Extract horizontal zones
+            left_zone = "left" if any("left" in p for p in positions) else None
+            center_zone = "center" in " ".join(positions)
+            right_zone = "right" if any("right" in p for p in positions) else None
+
+            # Build span description
+            span_parts = []
+            if left_zone:
+                span_parts.append("left")
+            if center_zone:
+                span_parts.append("center")
+            if right_zone:
+                span_parts.append("right")
+
+            span = " to ".join(span_parts) if len(span_parts) > 1 else span_parts[0]
+
+            rows.append({
+                'type': 'row',
+                'label': label,
+                'count': len(group),
+                'span': span,
+                'y_variance': y_variance
+            })
+
+    return rows
+
+
+def detect_stack_patterns(objects: List[Dict[str, Any]],
+                         x_tolerance: float = 50.0,
+                         min_count: int = 2) -> List[Dict[str, Any]]:
+    """
+    Detect vertical "stack" patterns: 2+ objects aligned vertically.
+
+    Stack Detection Algorithm:
+    1. Group objects by class label
+    2. Calculate X-coordinate variance (horizontal spread)
+    3. If variance is LOW (similar X) but Y-spread is HIGH → it's a stack
+    4. Report vertical position (typically "mid" or "bottom")
+
+    Geometric Math:
+    - x_tolerance = 50px means centroids must be within 50px horizontally
+    - Y-spread measures vertical extent (top-to-bottom)
+
+    Example: "A stack of 3 boxes (right side)"
+
+    Args:
+        objects: List of detected objects
+        x_tolerance: Max X-coordinate variance for stack detection (pixels)
+        min_count: Minimum objects to form a stack
+
+    Returns:
+        List of stack pattern metadata dicts
+    """
+    from collections import defaultdict
+
+    groups = defaultdict(list)
+    for obj in objects:
+        groups[obj['label']].append(obj)
+
+    stacks = []
+
+    for label, group in groups.items():
+        if len(group) < min_count:
+            continue
+
+        # Calculate centroids and coordinates
+        centroids = [calculate_centroid(obj) for obj in group]
+        x_coords = [c[0] for c in centroids]
+        y_coords = [c[1] for c in centroids]
+
+        # Check if X-variance is low (vertically aligned)
+        x_variance = np.var(x_coords)
+        y_spread = max(y_coords) - min(y_coords)
+
+        # Stack criteria: low X-variance, high Y-spread
+        if x_variance < (x_tolerance ** 2) and y_spread > 100:
+            # Determine horizontal position (use most common)
+            positions = [obj['position'] for obj in group]
+            horizontal = max(set(p.split('-')[1] for p in positions),
+                           key=lambda x: sum(1 for p in positions if x in p))
+
+            stacks.append({
+                'type': 'stack',
+                'label': label,
+                'count': len(group),
+                'position': horizontal,
+                'x_variance': x_variance
+            })
+
+    return stacks
+
+
+def process_detections(results, image_height: int, image_width: int) -> Dict[str, Any]:
+    """
+    Convert YOLO detections to high-fidelity semantic spatial data with clustering.
+
+    Enhanced Pipeline:
+    1. Extract raw detections with 3x3 grid positions
+    2. Detect geometric patterns (crowds, rows, stacks)
+    3. Assign cluster IDs to objects
+    4. Flag emergency situations
+
+    Args:
+        results: YOLO inference results
+        image_height: Height of input image
+        image_width: Width of input image
+
+    Returns:
+        dict: Enhanced JSON with objects, clusters, and emergency flag
+    """
+    objects = []
+    emergency_stop = False
+
+    # Step 1: Extract detections from YOLO results with 3x3 grid positions
+    if len(results) > 0 and results[0].boxes is not None:
+        boxes = results[0].boxes
+
+        for idx, box in enumerate(boxes):
+            # Extract bounding box coordinates [x1, y1, x2, y2]
+            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+
+            # Calculate bounding box center and dimensions
+            bbox_center_x = (x1 + x2) / 2
+            bbox_center_y = (y1 + y2) / 2
+            bbox_width = x2 - x1
+            bbox_height = y2 - y1
+
+            # Get class label and confidence
+            class_id = int(box.cls[0])
+            label = results[0].names[class_id].lower()
+            confidence = float(box.conf[0])
+
+            # Calculate 3x3 grid position (NEW: includes vertical awareness)
+            position = calculate_3x3_position(
+                bbox_center_x, bbox_center_y,
+                image_width, image_height
+            )
+
+            # Calculate distance (depth estimation)
+            distance = calculate_distance(bbox_height, image_height)
+
+            # Create enhanced object entry
+            obj = {
+                "id": idx,  # Unique ID for cluster tracking
+                "label": label,
+                "confidence": round(confidence, 2),
+                "position": position,  # Now 3x3 grid (e.g., "top-left", "mid-center")
+                "distance": distance,
+                "box": [int(x1), int(y1), int(x2), int(y2)],
+                "cluster_id": None  # Will be assigned if part of a cluster
+            }
+            objects.append(obj)
+
+            # Emergency Detection Logic
+            # Trigger if vehicle is dangerously close
+            if label in VEHICLE_CLASSES and distance in EMERGENCY_DISTANCES:
+                emergency_stop = True
+                logger.warning(
+                    f"⚠️  EMERGENCY: {label} detected at {distance} distance ({position})"
+                )
+
+    # Step 2: Detect geometric patterns (crowds, rows, stacks)
+    crowd_clusters = detect_crowd_clusters(objects)
+    row_patterns = detect_row_patterns(objects)
+    stack_patterns = detect_stack_patterns(objects)
+
+    # Combine all detected patterns
+    all_clusters = crowd_clusters + row_patterns + stack_patterns
+
+    # Step 3: Assign cluster IDs to objects (optional, for debugging)
+    # For simplicity, we'll use the cluster metadata in summary generation
+    # rather than modifying the objects array
+
+    return {
+        "objects": objects,
+        "clusters": all_clusters,  # NEW: Geometric pattern metadata
+        "emergency_stop": emergency_stop
+    }
+
+
+def generate_summary(objects: List[Dict[str, Any]],
+                    clusters: List[Dict[str, Any]]) -> str:
+    """
+    Generate sophisticated natural language scene description for LLM.
+
+    Natural Language Generation Strategy:
+    1. Prioritize clusters (crowds, rows, stacks) over individual objects
+    2. Use descriptive phrases instead of CSV format
+    3. Mention spatial relationships and arrangements
+    4. Keep it concise but informative (2-3 sentences max)
+
+    Examples:
+    - BAD:  "Chair (Left), Chair (Center), Person (Right)"
+    - GOOD: "A row of empty chairs spanning left to center, with a person standing to the right."
+
+    - BAD:  "Person (Center), Person (Center), Person (Center)"
+    - GOOD: "A dense cluster of 3 people gathered in the center of the frame."
+
+    Args:
+        objects: List of detected objects with 3x3 grid positions
+        clusters: List of detected geometric patterns (crowds, rows, stacks)
+
+    Returns:
+        str: Natural language scene description
+    """
+    if not objects:
+        return "Clear path ahead, no objects detected."
+
+    # Track which objects are part of clusters (to avoid double-counting)
+    clustered_labels = set()
+    summary_parts = []
+
+    # Step 1: Describe clusters first (higher priority)
+    for cluster in clusters:
+        label = cluster.get('label', 'object')
+        count = cluster.get('count', 0)
+        cluster_type = cluster.get('type', 'unknown')
+
+        # Pluralize label
+        plural_label = label + 's' if not label.endswith('s') else label
+
+        if cluster_type == 'crowd':
+            # Safe get for position with fallback
+            pos = cluster.get('position', 'mid-center').replace('-', ' ')
+            summary_parts.append(
+                f"a dense cluster of {count} {plural_label} ({pos})"
+            )
+
+        elif cluster_type == 'row':
+            # Safe get for span with fallback
+            span = cluster.get('span', 'across the frame')
+            summary_parts.append(
+                f"a row of {count} {plural_label} spanning from {span}"
+            )
+
+        elif cluster_type == 'stack':
+            # Safe get for position with fallback
+            pos = cluster.get('position', 'center')
+            summary_parts.append(
+                f"a stack of {count} {plural_label} ({pos} side)"
+            )
+
+        # Mark this label as clustered
+        clustered_labels.add(label)
+
+    # Step 2: Describe individual objects (not in clusters)
+    individual_objects = [
+        obj for obj in objects
+        if obj['label'] not in clustered_labels
+    ]
+
+    # Group individual objects by label for cleaner descriptions
+    from collections import defaultdict
+    singles = defaultdict(list)
+    for obj in individual_objects:
+        singles[obj['label']].append(obj)
+
+    for label, instances in singles.items():
+        if len(instances) == 1:
+            obj = instances[0]
+            position = obj['position'].replace('-', ' ')
+            distance = obj['distance']
+
+            # Add distance qualifier for close objects
+            distance_phrase = ""
+            if distance == "immediate":
+                distance_phrase = "directly in front, "
+            elif distance == "close":
+                distance_phrase = "nearby, "
+
+            summary_parts.append(f"a {label} ({distance_phrase}{position})")
+
+        else:
+            # Multiple instances but not clustered (spread out)
+            count = len(instances)
+            positions = [obj['position'].replace('-', ' ') for obj in instances]
+            unique_positions = list(set(positions))
+
+            if len(unique_positions) == 1:
+                summary_parts.append(
+                    f"{count} {label}s ({unique_positions[0]})"
+                )
+            else:
+                # Scattered across multiple zones
+                summary_parts.append(
+                    f"{count} {label}s scattered across the frame"
+                )
+
+    # Step 3: Combine into natural sentences
+    if len(summary_parts) == 0:
+        return "Scene contains objects but spatial analysis is incomplete."
+
+    elif len(summary_parts) == 1:
+        return summary_parts[0].capitalize() + "."
+
+    elif len(summary_parts) == 2:
+        return f"{summary_parts[0].capitalize()}, with {summary_parts[1]}."
+
+    else:
+        # 3+ elements: use commas and "and"
+        main_part = ", ".join(summary_parts[:-1])
+        last_part = summary_parts[-1]
+        return f"{main_part.capitalize()}, and {last_part}."
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Load YOLO model when server starts."""
+    load_yolo_model()
+
+
+@app.get("/")
+async def root():
+    """Health check endpoint."""
+    return {
+        "status": "online",
+        "service": "YOLO11 Vision Server",
+        "model": "yolo11n.pt"
+    }
+
+
+@app.get("/health")
+async def health():
+    """Detailed health check with model status."""
+    return {
+        "status": "healthy",
+        "model_loaded": yolo_model is not None,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+
+@sio.event
+async def connect(sid, environ):
+    """Handle client connection."""
+    logger.info(f"✓ Client connected: {sid}")
+    await sio.emit('connection_established', {'status': 'connected'}, room=sid)
+
+
+@sio.event
+async def disconnect(sid):
+    """Handle client disconnection."""
+    logger.info(f"✗ Client disconnected: {sid}")
+
+
+@sio.event
+async def video_frame(sid, data):
+    """
+    Process incoming video frame from iPhone client.
+
+    Pipeline:
+    1. Decode Base64 image
+    2. Run YOLO11 inference
+    3. Convert detections to semantic spatial data
+    4. Emit JSON result back to client
+
+    Args:
+        sid: Socket session ID
+        data: Dictionary containing 'frame' (Base64 encoded image)
+    """
+    try:
+        start_time = asyncio.get_event_loop().time()
+
+        # Extract base64 frame
+        if 'frame' not in data:
+            logger.error("No 'frame' field in received data")
+            await sio.emit('error', {'message': 'Missing frame data'}, room=sid)
+            return
+
+        base64_frame = data['frame']
+
+        # Step 1: Decode Base64 image
+        image = decode_base64_image(base64_frame)
+        image_height, image_width = image.shape[:2]
+        logger.info(f"📷 Received frame: {image_width}x{image_height}")
+
+        # Step 2: Run YOLO11 inference
+        results = yolo_model(image, verbose=False)
+
+        # Step 3: Convert to semantic spatial data with clustering
+        detection_data = process_detections(results, image_height, image_width)
+        objects = detection_data['objects']
+        clusters = detection_data['clusters']
+        emergency_stop = detection_data['emergency_stop']
+
+        # Step 4: Generate natural language summary for LLM
+        summary = generate_summary(objects, clusters)
+
+        # Construct final JSON response (matching specified schema)
+        response = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "emergency_stop": emergency_stop,
+            "summary": summary,
+            "objects": objects
+        }
+
+        # Calculate processing time
+        processing_time = (asyncio.get_event_loop().time() - start_time) * 1000
+        logger.info(
+            f"✓ Processed in {processing_time:.1f}ms | "
+            f"Objects: {len(objects)} | Emergency: {emergency_stop}"
+        )
+
+        # Emit result back to client
+        await sio.emit('scene_analysis', response, room=sid)
+
+    except Exception as e:
+        logger.error(f"Error processing video frame: {e}", exc_info=True)
+        await sio.emit('error', {
+            'message': 'Frame processing failed',
+            'error': str(e)
+        }, room=sid)
+
+
+if __name__ == "__main__":
+    logger.info("🚀 Starting YOLO11 Vision Server...")
+    logger.info("Model: YOLO11 Nano (yolo11n.pt)")
+    logger.info("Server will run on http://0.0.0.0:8000")
+
+    uvicorn.run(
+        socket_app,
+        host="0.0.0.0",
+        port=8000,
+        log_level="info"
+    )

@@ -12,7 +12,8 @@
       "supportsTablet": true,
       "bundleIdentifier": "com.aeye.aeye",
       "infoPlist": {
-        "ITSAppUsesNonExemptEncryption": false
+        "ITSAppUsesNonExemptEncryption": false,
+        "NSMicrophoneUsageDescription": "A-eye needs microphone access to stream audio."
       }
     },
     "android": {
@@ -23,7 +24,14 @@
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
       "edgeToEdgeEnabled": true,
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "permissions": [
+        "android.permission.RECORD_AUDIO",
+        "android.permission.MODIFY_AUDIO_SETTINGS",
+        "android.permission.RECORD_AUDIO",
+        "android.permission.MODIFY_AUDIO_SETTINGS"
+      ],
+      "package": "com.aeye.aeye"
     },
     "web": {
       "output": "static",
@@ -43,7 +51,6 @@
           }
         }
       ],
-      "expo-audio",
       "expo-stream-audio"
     ],
     "experiments": {

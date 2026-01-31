@@ -54,3 +54,6 @@ logs/
 
 # DO NOT COMMIT THIS FUCKING FILE
 vertex-api-key.json 
+
+# Max don't want this stuff
+*.wav

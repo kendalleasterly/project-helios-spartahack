@@ -116,10 +116,26 @@ interface UsePersonCommandsReturn {
 }
 
 /**
- * Clean up extracted name - remove punctuation and validate
+ * Clean up extracted name - remove punctuation, common prefixes, and validate
  */
 function cleanName(raw: string): string | null {
-  const name = raw.trim().replace(/[.,!?]+$/, '').trim();
+  let name = raw.trim().replace(/[.,!?]+$/, '').trim();
+  
+  // Remove common prefixes like "this is", "that is", "it's", etc.
+  const prefixPatterns = [
+    /^this\s+is\s+/i,
+    /^that\s+is\s+/i,
+    /^that's\s+/i,
+    /^it's\s+/i,
+    /^its\s+/i,
+    /^my\s+friend\s+/i,
+    /^my\s+/i,
+  ];
+  
+  for (const pattern of prefixPatterns) {
+    name = name.replace(pattern, '').trim();
+  }
+  
   // Name should be at least 2 characters
   if (name.length < 2) {
     return null;

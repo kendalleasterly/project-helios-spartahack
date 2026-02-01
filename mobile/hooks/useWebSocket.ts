@@ -10,10 +10,19 @@ export type ConnectionStatus =
   | "connected"
   | "error";
 
+export interface TextTokenEvent {
+  token: string;
+  emergency: boolean;
+  is_first: boolean;
+}
+
+export type TextTokenCallback = (event: TextTokenEvent) => void;
+
 interface UseWebSocketReturn {
   socket: Socket | null;
   status: ConnectionStatus;
   sendFrame: (base64Frame: string, debug?: boolean) => void;
+  onTextToken: (callback: TextTokenCallback) => void;
   connect: () => void;
   disconnect: () => void;
 }
@@ -21,6 +30,7 @@ interface UseWebSocketReturn {
 export function useWebSocket(): UseWebSocketReturn {
   const [status, setStatus] = useState<ConnectionStatus>("disconnected");
   const socketRef = useRef<Socket | null>(null);
+  const textTokenCallbackRef = useRef<TextTokenCallback | null>(null);
 
   const connect = useCallback(() => {
     if (socketRef.current?.connected) {
@@ -64,6 +74,12 @@ export function useWebSocket(): UseWebSocketReturn {
       setStatus("connecting");
     });
 
+    socket.on("text_token", (data: TextTokenEvent) => {
+      if (textTokenCallbackRef.current) {
+        textTokenCallbackRef.current(data);
+      }
+    });
+
     socketRef.current = socket;
   }, []);
 
@@ -84,6 +100,10 @@ export function useWebSocket(): UseWebSocketReturn {
     }
   }, []);
 
+  const onTextToken = useCallback((callback: TextTokenCallback) => {
+    textTokenCallbackRef.current = callback;
+  }, []);
+
   useEffect(() => {
     return () => {
       disconnect();
@@ -94,6 +114,7 @@ export function useWebSocket(): UseWebSocketReturn {
     socket: socketRef.current,
     status,
     sendFrame,
+    onTextToken,
     connect,
     disconnect,
   };

@@ -7,7 +7,7 @@
  * License: MIT
  */
 
-import * as FileSystem from 'expo-file-system';
+import * as FileSystem from 'expo-file-system/legacy';
 
 // Base URL for model downloads
 const MODEL_BASE_URL = 'https://huggingface.co/onnx-community/Kokoro-82M-ONNX/resolve/main/onnx';

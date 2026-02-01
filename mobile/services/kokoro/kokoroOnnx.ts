@@ -9,7 +9,7 @@
  * Modified for Project Helios streaming text-to-speech integration
  */
 
-import * as FileSystem from 'expo-file-system';
+import * as FileSystem from 'expo-file-system/legacy';
 import { InferenceSession, Tensor } from 'onnxruntime-react-native';
 import { Audio } from 'expo-av';
 import { VOICES, getVoiceData } from './voices';

@@ -11,7 +11,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useTextBuffer } from './useTextBuffer';
 import type { TextTokenEvent } from './useWebSocket';
-import { Asset } from 'expo-asset';
+import * as FileSystem from 'expo-file-system/legacy';
 
 // Lazy import Kokoro to avoid loading on module import
 let kokoroInstance: any = null;
@@ -49,21 +49,35 @@ export function useAudioGuidance({ onTextToken, enabled = true }: UseAudioGuidan
           kokoroInstance = module.default;
         }
 
-        // NOTE: Model loading from local assets doesn't work in dev mode
-        // The 89MB model file is too large for Metro bundler's require()
-        // This will work after EAS build when assets are properly bundled
+        // Download the model from HuggingFace if not cached
+        const modelPath = `${FileSystem.cacheDirectory}${MODEL_ID}.onnx`;
+        const modelInfo = await FileSystem.getInfoAsync(modelPath);
 
-        // For now, skip model loading in development
-        // The model will be available in the production build
-        console.log('⚠️  Kokoro TTS model loading skipped in dev mode');
-        console.log('   Model will load automatically in EAS production build');
+        if (!modelInfo.exists) {
+          console.log('Downloading Kokoro model (89 MB, first launch only)...');
+          const modelUrl = 'https://huggingface.co/onnx-community/Kokoro-82M-ONNX/resolve/main/onnx/model_quantized.onnx';
 
-        // Mark as ready so the rest of the app works
-        // TTS just won't generate audio until after native build
+          const downloadResult = await FileSystem.downloadAsync(modelUrl, modelPath);
+
+          if (downloadResult.status !== 200) {
+            throw new Error(`Failed to download model: ${downloadResult.status}`);
+          }
+
+          console.log('Model downloaded successfully');
+        } else {
+          console.log('Model already cached');
+        }
+
+        // Load the model into Kokoro
+        const loaded = await kokoroInstance.loadModel(`${MODEL_ID}.onnx`);
+
+        if (!loaded) {
+          throw new Error('Failed to load model into ONNX runtime');
+        }
 
         setIsReady(true);
         setError(null);
-        console.log('✓ Kokoro TTS ready (audio generation disabled in dev mode)');
+        console.log('✓ Kokoro TTS ready');
       } catch (err) {
         console.error('Failed to initialize Kokoro:', err);
         setError(err instanceof Error ? err.message : 'Unknown error');

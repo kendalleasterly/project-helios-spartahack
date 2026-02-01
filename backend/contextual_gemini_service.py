@@ -17,23 +17,20 @@ from google.genai.types import Part, GenerateContentConfig
 
 load_dotenv()
 
-SYSTEM_PROMPT = """You are a real-time navigation assistant for a blind person wearing a camera.
+VISION_SYSTEM_PROMPT = """You are a real-time navigation assistant for a blind person wearing a camera.
 
 You receive:
 1. Camera image
 2. YOLO object detection data (summary, objects with positions/distances)
 3. Recent history (your own past observations from the last 10 seconds)
-4. Optional user question
 
 IMPORTANT: Use the recent history to inform your decisions. If you recently described something and nothing has changed, stay SILENT. If the scene has changed significantly from your recent observations, SPEAK.
 
 DECISION RULES - When to SPEAK vs stay SILENT:
 
 SPEAK when:
-- User asked a question (ALWAYS respond)
 - Emergency/safety issue (vehicle close, obstacle immediate, hazard)
 - Scene changed significantly (entered new room, major layout change, new object type)
-- User requested action ("find my phone", "where can I sit", "read this")
 - Important navigation guidance (clear path, obstacle ahead, direction change)
 
 SILENT when:
@@ -52,11 +49,48 @@ OUTPUT FORMAT - CRITICAL:
 Examples:
 ✓ "SPEAK: Car approaching fast on your left, stop now!"
 ✓ "SPEAK: Empty chair directly ahead, about 5 feet"
-✓ "SPEAK: Your phone is on the table to your right"
 ✓ "SILENT: Same classroom, no significant changes"
 ✗ "The scene shows..." (WRONG - missing prefix!)
 
 Remember: You must maintain context from previous messages to avoid repeating yourself."""
+
+CONVERSATION_SYSTEM_PROMPT = """You are Helios, a helpful vision assistant for a blind person.
+
+The user has asked you a question. You MUST answer it.
+
+You receive:
+1. Camera image showing what's in front of the user
+2. YOLO object detection data (summary, objects with positions/distances)
+3. Spatial context from recent observations (objects seen in the past 30 seconds)
+4. The user's question
+
+CRITICAL RULES:
+- ALWAYS respond to the user's question - NEVER stay silent
+- Be concise (under 30 words unless the question requires detail)
+- Be direct and helpful
+- Use spatial language: "left", "right", "ahead", "behind", "close", "far"
+- If you can't answer from the image, say so briefly
+
+OUTPUT FORMAT:
+- DO NOT use any prefix
+- Just provide your answer directly
+- Use present tense
+- Be conversational and friendly
+
+Examples:
+User: "What's in front of me?"
+You: "A brown chair about 5 feet ahead, slightly to your left."
+
+User: "Where can I sit?"
+You: "There's a chair directly ahead, about 6 feet away."
+
+User: "What does this say?"
+You: "I can see text but it's too blurry to read clearly."
+
+User: "Is there a person here?"
+You: "No, I don't see any people in the current view."
+
+Remember: You are answering a direct question from the user. Always provide a helpful response."""
 
 
 @dataclass
@@ -77,7 +111,8 @@ class GeminiContextualNarrator:
     def __init__(
         self,
         model: str = "gemini-2.5-flash",
-        max_context_messages: int = 20
+        max_context_messages: int = 20,
+        system_prompt: str = VISION_SYSTEM_PROMPT
     ):
         project = os.environ.get("GOOGLE_CLOUD_PROJECT")
         location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
@@ -93,6 +128,7 @@ class GeminiContextualNarrator:
         self.model = model
         self.context_history = []
         self.max_context_messages = max_context_messages
+        self.system_prompt = system_prompt
 
     def _decode_image(self, image_data: str) -> bytes:
         """Decode base64 image, handling data URL prefix."""
@@ -186,10 +222,13 @@ class GeminiContextualNarrator:
         })
 
         # Call Gemini with streaming
+        # Note: Increased max_output_tokens significantly to account for thinking tokens
+        # Gemini 2.5-flash may use internal reasoning tokens that count against the limit
+        # 150→10 chars output, 500→60 chars output, trying 2048 for complete sentences
         config = GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
+            system_instruction=self.system_prompt,
             temperature=0.7,
-            max_output_tokens=150
+            max_output_tokens=2048  # Large buffer for thinking tokens + complete response
         )
 
         response_stream = await self.client.aio.models.generate_content_stream(
@@ -203,34 +242,68 @@ class GeminiContextualNarrator:
         full_response = ""
         prefix_removed = False
 
-        async for chunk in response_stream:
-            if chunk.text:
-                if first_chunk_time is None:
-                    first_chunk_time = time.perf_counter()
+        import logging
+        logger = logging.getLogger(__name__)
 
-                full_response += chunk.text
+        try:
+            chunk_count = 0
+            logger.info(f"🔄 Starting to consume Gemini response stream...")
+            async for chunk in response_stream:
+                chunk_count += 1
 
-                # Parse decision from first chunks
-                if should_speak is None:
-                    # Check if we have enough to determine SPEAK: or SILENT:
-                    if full_response.startswith("SPEAK:"):
-                        should_speak = True
-                        # Remove prefix and yield clean text
-                        clean_text = full_response[6:].lstrip()
-                        yield (True, clean_text)
-                        prefix_removed = True
-                    elif full_response.startswith("SILENT:"):
-                        should_speak = False
-                        # Remove prefix
-                        clean_text = full_response[7:].lstrip()
-                        yield (False, clean_text)
-                        # Don't stream further if silent (save tokens/latency)
-                        break
-                    # Keep buffering if we don't have the prefix yet
-                    continue
+                if chunk.text:
+                    logger.info(f"📦 Chunk #{chunk_count}: '{chunk.text}' (len={len(chunk.text)})")
+
+                    if first_chunk_time is None:
+                        first_chunk_time = time.perf_counter()
+                        logger.info(f"⏱️  First chunk received after {(first_chunk_time - start_time)*1000:.0f}ms")
+
+                    full_response += chunk.text
+                    logger.info(f"📝 Full response so far: '{full_response}'")
+
+                    # Parse decision from first chunks (for vision mode with SPEAK:/SILENT: prefix)
+                    if should_speak is None:
+                        # Check if this uses the SPEAK:/SILENT: prefix format
+                        if full_response.startswith("SPEAK:") or full_response.startswith("SILENT:"):
+                            logger.info(f"🔍 Checking for SPEAK:/SILENT: prefix in: '{full_response}'")
+                            if full_response.startswith("SPEAK:"):
+                                should_speak = True
+                                # Remove prefix and yield clean text
+                                clean_text = full_response[6:].lstrip()
+                                logger.info(f"✅ SPEAK decision detected! Clean text: '{clean_text}'")
+                                yield (True, clean_text)
+                                prefix_removed = True
+                            elif full_response.startswith("SILENT:"):
+                                should_speak = False
+                                # Remove prefix
+                                clean_text = full_response[7:].lstrip()
+                                logger.info(f"🔇 SILENT decision detected! Clean text: '{clean_text}'")
+                                yield (False, clean_text)
+                                # Don't stream further if silent (save tokens/latency)
+                                break
+                            # Keep buffering if we don't have the full prefix yet
+                            continue
+                        else:
+                            # No prefix format - this is conversation mode, always speak
+                            logger.info(f"📝 No SPEAK:/SILENT: prefix - conversation mode (always speak)")
+                            should_speak = True
+                            yield (True, chunk.text)
+                    else:
+                        # Already determined decision, stream subsequent chunks
+                        logger.info(f"➡️ Yielding chunk: '{chunk.text}'")
+                        yield (should_speak, chunk.text)
                 else:
-                    # Already determined decision, stream subsequent chunks
-                    yield (should_speak, chunk.text)
+                    # Empty chunk - check finish reason
+                    logger.warning(f"⚠️ Empty chunk #{chunk_count}")
+                    if hasattr(chunk, 'candidates') and chunk.candidates:
+                        for candidate in chunk.candidates:
+                            if hasattr(candidate, 'finish_reason'):
+                                logger.warning(f"⚠️ Finish reason: {candidate.finish_reason}")
+
+            logger.info(f"✅ Stream completed. Total chunks: {chunk_count} | Final response: '{full_response}'")
+        except Exception as e:
+            logger.error(f"❌ Stream error after {chunk_count} chunks: {e}", exc_info=True)
+            raise
 
         end_time = time.perf_counter()
 
@@ -352,13 +425,15 @@ class BlindAssistantService:
         # Vision monitoring narrator - maintains scene understanding
         self.vision_narrator = GeminiContextualNarrator(
             model="gemini-2.5-flash",
-            max_context_messages=20  # Internal vision model context
+            max_context_messages=20,  # Internal vision model context
+            system_prompt=VISION_SYSTEM_PROMPT
         )
 
-        # Conversation narrator - handles user queries
+        # Conversation narrator - handles user queries (ALWAYS responds)
         self.conversation_narrator = GeminiContextualNarrator(
             model="gemini-2.5-flash",
-            max_context_messages=10  # Recent conversation history
+            max_context_messages=10,  # Recent conversation history
+            system_prompt=CONVERSATION_SYSTEM_PROMPT  # Different prompt - no SPEAK/SILENT logic
         )
 
         # Spatial memory: rolling buffer of scene snapshots
@@ -378,26 +453,24 @@ class BlindAssistantService:
         """
         Vision Pipeline: Process incoming frame (called every ~1 second).
 
-        Builds spatial memory and occasionally speaks for safety/major changes.
-
-        CIRCULAR ARCHITECTURE: Vision cache feeds back into vision processing,
-        allowing the model to see its recent history and make better decisions.
+        NEW BEHAVIOR: Only speaks for immediate safety/emergency warnings.
+        Otherwise, silently builds spatial memory for future conversation queries.
 
         Args:
             frame_base64: Base64-encoded frame image
             yolo_objects: YOLO detection results with summary, objects, emergency flag
 
         Returns:
-            Text to speak if vision model decides to (None if SILENT)
+            Text to speak ONLY for immediate danger (None otherwise)
         """
-        # Update cache
+        # Update cache for conversation queries
         self.latest_frame = frame_base64
         self.latest_yolo = yolo_objects
 
-        # Check for immediate danger (local rules can override for instant response)
+        # Check for immediate danger (ONLY time vision pipeline speaks on its own)
         immediate_danger = self._check_immediate_danger(yolo_objects)
         if immediate_danger:
-            # Store in history but return immediately
+            # Store in history and return emergency warning
             snapshot = SceneSnapshot(
                 timestamp=time.time(),
                 yolo_objects=yolo_objects,
@@ -407,36 +480,17 @@ class BlindAssistantService:
             self.scene_history.append(snapshot)
             return immediate_danger
 
-        # CIRCULAR: Build vision history summary for vision model
-        vision_history = self._build_vision_history_context()
-
-        # Add vision history to scene analysis (circular feedback)
-        scene_analysis_with_history = {
-            **yolo_objects,  # Include all YOLO data
-            "recent_history": vision_history  # Add vision cache
-        }
-
-        # Vision model analyzes scene WITH its own recent history
-        response = await self.vision_narrator.process_input(
-            scene_analysis=scene_analysis_with_history,
-            image_base64=frame_base64,
-            user_question=None
-        )
-
-        # Store snapshot in spatial memory
+        # No emergency: silently update spatial memory without calling Gemini
+        # Gemini will only be called when user asks a question (conversation pipeline)
         snapshot = SceneSnapshot(
             timestamp=time.time(),
             yolo_objects=yolo_objects,
-            scene_description=response.full_text,
+            scene_description="SILENT (no question asked)",  # Placeholder
             frame_base64=frame_base64 if self.config.store_frames else None
         )
         self.scene_history.append(snapshot)
 
-        # Return text if vision model wants to speak
-        if response.should_speak:
-            return response.full_text
-
-        return None
+        return None  # Stay silent unless emergency
 
     async def process_user_speech(
         self,
@@ -453,11 +507,21 @@ class BlindAssistantService:
         Returns:
             Text response to speak to user
         """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        logger.info(f"💬 CONVERSATION PIPELINE | Question: '{user_question}'")
+
         if not self.latest_frame:
+            logger.warning("⚠️ No latest frame available yet")
             return "I haven't seen anything yet. Please wait a moment."
 
+        logger.info(f"✅ Latest frame available | Has YOLO: {self.latest_yolo is not None}")
+
         # Build enriched spatial context from vision history
+        logger.info("🔨 Building spatial context from vision history...")
         spatial_context = self._build_spatial_context()
+        logger.info(f"📝 Spatial context built: {len(spatial_context)} chars")
 
         # Create scene analysis with spatial context
         scene_analysis = {
@@ -465,13 +529,17 @@ class BlindAssistantService:
             "objects": self.latest_yolo.get("objects", []) if self.latest_yolo else [],
             "emergency_stop": False  # User questions aren't emergencies
         }
+        logger.info(f"📊 Scene analysis | Objects: {len(scene_analysis['objects'])}")
 
         # Conversation model gets vision context + question
+        logger.info("🤖 Calling conversation narrator.process_input...")
         response = await self.conversation_narrator.process_input(
             scene_analysis=scene_analysis,
             image_base64=self.latest_frame,
             user_question=user_question
         )
+
+        logger.info(f"✅ Got response | Should speak: {response.should_speak} | Text: '{response.full_text}' | Length: {len(response.full_text)}")
 
         return response.full_text
 

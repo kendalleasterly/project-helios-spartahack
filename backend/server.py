@@ -32,7 +32,7 @@ load_dotenv()
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.INFO,  # Back to INFO now that we've diagnosed the issue
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
@@ -60,6 +60,9 @@ yolo_model = None
 
 # Global Blind Assistant Service (dual-pipeline architecture)
 assistant = None
+
+# Lock to ensure only one Gemini vision call at a time (prevents concurrent API calls)
+gemini_vision_lock = asyncio.Lock()
 
 # Vehicle classes that trigger emergency warnings
 VEHICLE_CLASSES = {'car', 'bus', 'truck', 'motorcycle', 'bicycle'}
@@ -1013,6 +1016,10 @@ async def health():
     }
 
 
+# ============================================================================
+# WEBSOCKET EVENT HANDLERS
+# ============================================================================
+
 @sio.event
 async def connect(sid, environ):
     """Handle client connection."""
@@ -1033,17 +1040,18 @@ async def video_frame_streaming(sid, data):
 
     Two modes:
     1. Vision Pipeline (no user_question): Continuous monitoring @ 1 FPS
-       - Builds spatial memory
-       - Occasionally speaks for safety/major changes
+       - Silently builds spatial memory
+       - Only speaks for emergency warnings
 
-    2. Conversation Pipeline (with user_question): On-demand queries
-       - Accesses vision history for context
-       - Always responds to user questions
+    2. Conversation Pipeline (user_question present): User asked a question
+       - Frontend already handled wake word detection
+       - Process question with Gemini using current frame + vision history
+       - Send response to user
 
     Data format:
     {
         'frame': base64_image,
-        'user_question': Optional[str],  # User's question if any
+        'user_question': Optional[str],  # Question from frontend (wake word already processed)
         'debug': bool
     }
     """
@@ -1065,7 +1073,8 @@ async def video_frame_streaming(sid, data):
         image_height, image_width = image.shape[:2]
 
         mode = "CONVERSATION" if user_question else "VISION"
-        logger.info(f"📷 Frame [{mode}]: {image_width}x{image_height} | Question: {user_question or 'None'}")
+        lock_status = "🔒 LOCKED" if gemini_vision_lock.locked() else "🔓 UNLOCKED"
+        logger.info(f"📷 Frame [{mode}]: {image_width}x{image_height} | Lock: {lock_status} | Question: {user_question or 'None'}")
 
         # Step 2: Run YOLO inference
         inference_start = asyncio.get_event_loop().time()
@@ -1111,43 +1120,55 @@ async def video_frame_streaming(sid, data):
         response_text = None
 
         if user_question:
-            # CONVERSATION PIPELINE: User asked a question
-            logger.info("🗣️  CONVERSATION PIPELINE: Processing user question")
+            # CONVERSATION PIPELINE: Frontend already handled wake word, just process the question
+            logger.info(f"🎤 USER QUESTION RECEIVED: '{user_question}' | Length: {len(user_question)} | SID: {sid}")
 
             try:
-                response_text = await assistant.process_user_speech(user_question)
-                logger.info(f"✓ Conversation response: {response_text}")
+                # Call Gemini with the question directly
+                async with gemini_vision_lock:
+                    gemini_start = asyncio.get_event_loop().time()
+                    logger.info(f"🤖 CALLING GEMINI with question: '{user_question}'")
 
-                # Send complete response to client
-                await sio.emit('text_response', {
-                    'text': response_text,
-                    'mode': 'conversation',
-                    'emergency': emergency_stop
-                }, room=sid)
+                    response_text = await assistant.process_user_speech(user_question)
+                    gemini_duration = (asyncio.get_event_loop().time() - gemini_start) * 1000
+
+                    logger.info(f"✅ GEMINI RESPONSE RECEIVED | Duration: {gemini_duration:.0f}ms | Length: {len(response_text)} chars")
+                    logger.info(f"📝 Full Response: '{response_text}'")
+
+                    # Send response to client
+                    logger.info(f"📡 Emitting 'text_response' to client {sid}...")
+                    await sio.emit('text_response', {
+                        'text': response_text,
+                        'mode': 'conversation',
+                        'emergency': False
+                    }, room=sid)
+                    logger.info(f"✅ Response emitted successfully")
 
             except Exception as e:
-                logger.error(f"✗ Conversation pipeline error: {e}", exc_info=True)
-                await sio.emit('error', {'message': f'Conversation failed: {e}'}, room=sid)
+                logger.error(f"❌ Error processing user question: {e}", exc_info=True)
+                await sio.emit('error', {'message': f'Failed to process question: {e}'}, room=sid)
 
         else:
             # VISION PIPELINE: Continuous monitoring (no question)
-            logger.info("👁️  VISION PIPELINE: Processing frame for monitoring")
+            # NEW BEHAVIOR: Only speaks for emergency/safety warnings
+            # Otherwise, silently builds spatial memory for future conversation queries
 
             try:
+                # Check for emergency warnings (doesn't call Gemini unless immediate danger)
                 response_text = await assistant.process_frame(base64_frame, yolo_results)
 
                 if response_text:
-                    # Vision model decided to speak (safety/major change)
-                    logger.info(f"🔊 Vision wants to speak: {response_text}")
+                    # Emergency/safety warning detected
+                    logger.warning(f"🚨 EMERGENCY WARNING: {response_text}")
 
                     await sio.emit('text_response', {
                         'text': response_text,
                         'mode': 'vision',
-                        'emergency': emergency_stop
+                        'emergency': True  # Always true if vision pipeline speaks
                     }, room=sid)
                 else:
-                    # Silent - vision model saw nothing important
-                    logger.info("🔇 Vision: SILENT (no significant changes)")
+                    # Normal operation - silently building spatial memory
+                    logger.debug("👁️  Vision: Spatial memory updated (silent)")
 
             except Exception as e:
                 logger.error(f"✗ Vision pipeline error: {e}", exc_info=True)
@@ -1167,11 +1188,22 @@ async def video_frame_streaming(sid, data):
             }, room=sid)
 
         total_time = (asyncio.get_event_loop().time() - start_time) * 1000
-        logger.info(
-            f"✓ Total [{mode}]: {total_time:.1f}ms | "
-            f"Objects: {len(objects)} | Emergency: {emergency_stop} | "
-            f"Response: {response_text[:50] if response_text else 'SILENT'}..."
-        )
+
+        # Detailed timing breakdown for latency monitoring
+        if user_question:
+            logger.info(
+                f"✅ [{mode}] COMPLETE: {total_time:.0f}ms total | "
+                f"YOLO: {inference_ms:.0f}ms | "
+                f"Objects: {len(objects)} | "
+                f"Response: {response_text[:80] if response_text else 'N/A'}..."
+            )
+        else:
+            # Vision pipeline - just cache update
+            logger.debug(
+                f"✅ [{mode}] COMPLETE: {total_time:.0f}ms | "
+                f"YOLO: {inference_ms:.0f}ms | Objects: {len(objects)} | "
+                f"Emergency: {emergency_stop}"
+            )
 
     except Exception as e:
         logger.error(f"Error processing video frame: {e}", exc_info=True)

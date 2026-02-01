@@ -60,7 +60,9 @@
         {
           "cameraPermissionText": "Helios needs camera access to provide visual guidance and navigation assistance."
         }
-      ]
+      ],
+      "expo-asset",
+      "@react-native-voice/voice"
     ],
     "experiments": {
       "typedRoutes": true,

@@ -2,7 +2,7 @@
 
 > **An AI-powered assistive navigation system for blind users using computer vision, real-time object detection, and conversational AI.**
 
-Project Helios (branded as "a-eye") is a comprehensive mobile application that provides real-time spatial awareness and navigation assistance for blind users through advanced computer vision, YOLO11 object detection, and Google's Gemini AI.
+Project Helios is a comprehensive mobile application that provides real-time spatial awareness and navigation assistance for blind users through advanced computer vision, YOLO11 object detection, and Google's Gemini AI.
 
 ## 🌟 Overview
 

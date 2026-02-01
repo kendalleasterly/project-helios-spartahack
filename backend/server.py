@@ -25,8 +25,7 @@ from fastapi import FastAPI
 from PIL import Image
 from ultralytics import YOLO
 
-from gemini_service import GeminiLiveNarrator, NarrationResult
-from contextual_gemini_service import GeminiContextualNarrator
+from contextual_gemini_service import BlindAssistantService, ContextConfig
 
 # Load environment variables
 load_dotenv()
@@ -59,9 +58,8 @@ socket_app = socketio.ASGIApp(
 # Global YOLO model (loaded at startup)
 yolo_model = None
 
-# Global Gemini narrators (loaded at startup)
-gemini_narrator = None  # Legacy Live API narrator
-contextual_narrator = None  # New streaming text narrator
+# Global Blind Assistant Service (dual-pipeline architecture)
+assistant = None
 
 # Vehicle classes that trigger emergency warnings
 VEHICLE_CLASSES = {'car', 'bus', 'truck', 'motorcycle', 'bicycle'}
@@ -955,70 +953,37 @@ def generate_summary(objects: List[Dict[str, Any]],
         return f"{main_part.capitalize()}, and {last_part}."
 
 
-async def call_gemini(scene_analysis: Dict[str, Any], image_base64: str) -> Optional[NarrationResult]:
-    """
-    Call Gemini Live API for audio narration using Ben's implementation.
-
-    Args:
-        scene_analysis: Dict with 'summary', 'objects', 'emergency_stop'
-        image_base64: Base64-encoded JPEG image
-
-    Returns:
-        NarrationResult with audio data and metrics, or None if Gemini not available
-    """
-    if gemini_narrator is None:
-        logger.warning("⚠️  Gemini narrator not initialized, skipping narration")
-        return None
-
-    try:
-        logger.info("🤖 Calling Gemini Live API for narration...")
-        logger.info(f"   Summary: {scene_analysis.get('summary', 'N/A')}")
-        logger.info(f"   Emergency: {scene_analysis.get('emergency_stop', False)}")
-
-        # Call Ben's Gemini implementation
-        result = await gemini_narrator.narrate_with_image(
-            scene_analysis=scene_analysis,
-            image_base64=image_base64
-        )
-
-        logger.info(f"✓ Gemini narration complete:")
-        logger.info(f"   Latency: {result.latency_ms:.1f}ms")
-        logger.info(f"   Total: {result.total_ms:.1f}ms")
-        logger.info(f"   Audio size: {len(result.audio_data)} bytes")
-        logger.info(f"   Cached: {result.cached}")
-        if result.transcript:
-            logger.info(f"   Transcript: {result.transcript}")
-
-        return result
-
-    except Exception as e:
-        logger.error(f"✗ Gemini narration failed: {e}", exc_info=True)
-        return None
+# Removed old call_gemini function - now using BlindAssistantService
 
 
 @app.on_event("startup")
 async def startup_event():
-    """Load YOLO model and setup debug output directory when server starts."""
-    global gemini_narrator, contextual_narrator
+    """Load YOLO model and setup Blind Assistant Service when server starts."""
+    global assistant
 
     load_yolo_model()
 
-    # Initialize Contextual Gemini narrator (primary)
+    # Initialize Blind Assistant Service (dual-pipeline architecture)
     try:
-        logger.info("🤖 Initializing Contextual Gemini Narrator...")
-        contextual_narrator = GeminiContextualNarrator()
-        logger.info("✓ Contextual Narrator initialized successfully")
-    except Exception as e:
-        logger.error(f"✗ Failed to initialize contextual narrator: {e}")
-        logger.warning("⚠️  Server will continue without Gemini narration")
+        logger.info("🤖 Initializing Blind Assistant Service (Dual-Pipeline)...")
 
-    # Initialize Legacy Gemini Live narrator (fallback)
-    try:
-        logger.info("🤖 Initializing Gemini Live Narrator (fallback)...")
-        gemini_narrator = GeminiLiveNarrator()
-        logger.info("✓ Gemini Live Narrator initialized successfully")
+        # Configure context settings
+        config = ContextConfig(
+            spatial_lookback_seconds=30,  # 30s for conversation context
+            vision_history_lookback_seconds=10,  # 10s for vision feedback
+            max_scene_history=60,  # Keep 60 seconds of scene history
+            store_frames=False  # Don't store frames (memory optimization)
+        )
+
+        assistant = BlindAssistantService(config)
+        logger.info("✓ Blind Assistant Service initialized successfully")
+        logger.info("  - Vision Pipeline: Continuous monitoring with spatial memory")
+        logger.info("  - Conversation Pipeline: On-demand with context injection")
+        logger.info("  - Model: gemini-2.5-flash")
+
     except Exception as e:
-        logger.error(f"✗ Failed to initialize Gemini narrator: {e}")
+        logger.error(f"✗ Failed to initialize Blind Assistant Service: {e}")
+        logger.warning("⚠️  Server will continue without Gemini assistance")
 
     # Setup debug output directory
     if SAVE_DEBUG_FRAMES:
@@ -1064,12 +1029,16 @@ async def disconnect(sid):
 @sio.event
 async def video_frame_streaming(sid, data):
     """
-    Process video frame with streaming text response (NEW APPROACH).
+    Process video frame with DUAL-PIPELINE architecture.
 
-    This uses the contextual Gemini narrator that:
-    1. Decides whether to speak based on context
-    2. Streams text tokens to phone for on-device TTS
-    3. Maintains conversation history
+    Two modes:
+    1. Vision Pipeline (no user_question): Continuous monitoring @ 1 FPS
+       - Builds spatial memory
+       - Occasionally speaks for safety/major changes
+
+    2. Conversation Pipeline (with user_question): On-demand queries
+       - Accesses vision history for context
+       - Always responds to user questions
 
     Data format:
     {
@@ -1094,7 +1063,9 @@ async def video_frame_streaming(sid, data):
         # Step 1: Decode image
         image = decode_base64_image(base64_frame)
         image_height, image_width = image.shape[:2]
-        logger.info(f"📷 Frame: {image_width}x{image_height} | Question: {user_question or 'None'}")
+
+        mode = "CONVERSATION" if user_question else "VISION"
+        logger.info(f"📷 Frame [{mode}]: {image_width}x{image_height} | Question: {user_question or 'None'}")
 
         # Step 2: Run YOLO inference
         inference_start = asyncio.get_event_loop().time()
@@ -1124,48 +1095,63 @@ async def video_frame_streaming(sid, data):
         # Step 4: Generate summary
         summary = generate_summary(objects, clusters)
 
-        # Step 5: Build scene analysis
-        scene_analysis = {
+        # Step 5: Build YOLO results dict
+        yolo_results = {
             "summary": summary,
             "objects": objects,
             "emergency_stop": emergency_stop
         }
 
-        # Step 6: Stream Gemini response
-        if contextual_narrator:
-            logger.info("🤖 Calling Contextual Gemini (streaming mode)...")
+        # Step 6: Route to appropriate pipeline
+        if not assistant:
+            logger.warning("⚠️  Blind Assistant Service not initialized")
+            await sio.emit('error', {'message': 'Assistant service not available'}, room=sid)
+            return
 
-            token_count = 0
-            first_token_time = None
+        response_text = None
 
-            async for should_speak, text_chunk in contextual_narrator.process_streaming(
-                scene_analysis=scene_analysis,
-                image_base64=base64_frame,
-                user_question=user_question
-            ):
-                if first_token_time is None:
-                    first_token_time = asyncio.get_event_loop().time()
-                    gemini_latency = (first_token_time - start_time) * 1000
-                    logger.info(f"✓ First token: {gemini_latency:.1f}ms")
+        if user_question:
+            # CONVERSATION PIPELINE: User asked a question
+            logger.info("🗣️  CONVERSATION PIPELINE: Processing user question")
 
-                if should_speak:
-                    # Stream text token to phone for TTS
-                    await sio.emit('text_token', {
-                        'token': text_chunk,
-                        'emergency': emergency_stop,
-                        'is_first': (token_count == 0)
-                    }, room=sid)
-                    token_count += 1
-                else:
-                    # Silent response - log but don't send
-                    logger.info(f"🔇 SILENT response: {text_chunk}")
-                    break
+            try:
+                response_text = await assistant.process_user_speech(user_question)
+                logger.info(f"✓ Conversation response: {response_text}")
 
-            if token_count > 0:
-                logger.info(f"🔊 Streamed {token_count} text tokens to client")
+                # Send complete response to client
+                await sio.emit('text_response', {
+                    'text': response_text,
+                    'mode': 'conversation',
+                    'emergency': emergency_stop
+                }, room=sid)
+
+            except Exception as e:
+                logger.error(f"✗ Conversation pipeline error: {e}", exc_info=True)
+                await sio.emit('error', {'message': f'Conversation failed: {e}'}, room=sid)
 
         else:
-            logger.warning("⚠️  Contextual narrator not initialized")
+            # VISION PIPELINE: Continuous monitoring (no question)
+            logger.info("👁️  VISION PIPELINE: Processing frame for monitoring")
+
+            try:
+                response_text = await assistant.process_frame(base64_frame, yolo_results)
+
+                if response_text:
+                    # Vision model decided to speak (safety/major change)
+                    logger.info(f"🔊 Vision wants to speak: {response_text}")
+
+                    await sio.emit('text_response', {
+                        'text': response_text,
+                        'mode': 'vision',
+                        'emergency': emergency_stop
+                    }, room=sid)
+                else:
+                    # Silent - vision model saw nothing important
+                    logger.info("🔇 Vision: SILENT (no significant changes)")
+
+            except Exception as e:
+                logger.error(f"✗ Vision pipeline error: {e}", exc_info=True)
+                await sio.emit('error', {'message': f'Vision processing failed: {e}'}, room=sid)
 
         # Step 7: Send debug frame if requested
         if debug_mode:
@@ -1176,11 +1162,16 @@ async def video_frame_streaming(sid, data):
             await sio.emit('debug_frame', {
                 'frame': f"data:image/jpeg;base64,{debug_base64}",
                 'summary': summary,
-                'object_count': len(objects)
+                'object_count': len(objects),
+                'mode': mode
             }, room=sid)
 
         total_time = (asyncio.get_event_loop().time() - start_time) * 1000
-        logger.info(f"✓ Total pipeline: {total_time:.1f}ms | Objects: {len(objects)} | Emergency: {emergency_stop}")
+        logger.info(
+            f"✓ Total [{mode}]: {total_time:.1f}ms | "
+            f"Objects: {len(objects)} | Emergency: {emergency_stop} | "
+            f"Response: {response_text[:50] if response_text else 'SILENT'}..."
+        )
 
     except Exception as e:
         logger.error(f"Error processing video frame: {e}", exc_info=True)
@@ -1193,7 +1184,10 @@ async def video_frame_streaming(sid, data):
 @sio.event
 async def video_frame(sid, data):
     """
-    Process incoming video frame from iPhone client.
+    Process incoming video frame from iPhone client (LEGACY ENDPOINT).
+
+    NOTE: For AI assistance, use 'video_frame_streaming' instead.
+    This endpoint only returns YOLO detection results without Gemini processing.
 
     Pipeline:
     1. Decode Base64 image
@@ -1305,33 +1299,10 @@ async def video_frame(sid, data):
                 # Don't crash the websocket if disk I/O fails
                 logger.error(f"⚠️  Failed to save debug frame: {disk_error}")
 
-        # Step 6: Call Gemini Live API for audio narration
-        scene_analysis = {
-            "summary": summary,
-            "objects": objects,
-            "emergency_stop": emergency_stop
-        }
-
-        narration_result = await call_gemini(scene_analysis, base64_frame)
-
-        # Send audio narration to client if available
-        if narration_result:
-            # Play audio on server speakers for testing (blocking call)
-            play_audio_on_server(narration_result.audio_data, sample_rate=24000)
-
-            # Convert audio data to base64 for transmission
-            audio_base64 = base64.b64encode(narration_result.audio_data).decode('utf-8')
-
-            await sio.emit('audio_narration', {
-                'audio_data': audio_base64,  # Base64-encoded PCM audio (24kHz, 16-bit, mono)
-                'transcript': narration_result.transcript,
-                'latency_ms': narration_result.latency_ms,
-                'total_ms': narration_result.total_ms,
-                'cached': narration_result.cached,
-                'emergency': emergency_stop,
-                'timestamp': response['timestamp']
-            }, room=sid)
-            logger.info("🔊 Audio narration sent to client")
+        # Step 6: Emit YOLO results to client
+        # Note: This endpoint is for legacy compatibility - use video_frame_streaming for AI assistance
+        await sio.emit('detection_result', response, room=sid)
+        logger.info("✓ Detection results sent to client")
 
     except Exception as e:
         logger.error(f"Error processing video frame: {e}", exc_info=True)

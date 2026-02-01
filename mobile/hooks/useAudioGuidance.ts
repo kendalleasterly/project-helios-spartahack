@@ -7,8 +7,9 @@
  * 3. Speak using native TTS
  */
 
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import * as Speech from 'expo-speech';
+import { VoiceQuality } from 'expo-speech';
 import { Audio } from 'expo-av';
 import { useTextBuffer } from './useTextBuffer';
 import type { TextTokenEvent } from './useWebSocket';
@@ -59,6 +60,18 @@ export function useAudioGuidance({ onTextToken, enabled = true }: UseAudioGuidan
         console.log('[AudioGuidance] Checking native TTS availability...');
         const voices = await Speech.getAvailableVoicesAsync();
         console.log(`[AudioGuidance] Found ${voices.length} voices`);
+        if (voices.length > 0) {
+          const voiceSummaries = voices.map((voice) => ({
+            id: voice.identifier,
+            name: voice.name,
+            language: voice.language,
+            quality: voice.quality,
+          }));
+          console.log('[AudioGuidance] Voice options:', voiceSummaries);
+
+          const enhancedVoices = voices.filter((voice) => voice.quality === VoiceQuality.Enhanced);
+          console.log(`[AudioGuidance] Enhanced voices: ${enhancedVoices.length}`);
+        }
         
         // Find a good English voice
         const englishVoices = voices.filter(v => v.language.startsWith('en'));
@@ -88,14 +101,20 @@ export function useAudioGuidance({ onTextToken, enabled = true }: UseAudioGuidan
       return;
     }
 
+    const cleanedText = nextSentence.text.replace(/^\s*guidance\s*:\s*/i, '').trim();
+    if (!cleanedText) {
+      playNextInQueue();
+      return;
+    }
+
     isPlayingRef.current = true;
     setIsSpeaking(true);
 
-    console.log(`[AudioGuidance] Speaking: "${nextSentence.text}"`);
+    console.log(`[AudioGuidance] Speaking: "${cleanedText}"`);
 
-    Speech.speak(nextSentence.text, {
+    Speech.speak(cleanedText, {
       language: 'en-US',
-      rate: nextSentence.emergency ? 1.2 : 1.0,
+      rate: 1.25,
       pitch: 1.0,
       onDone: () => {
         console.log('[AudioGuidance] Speech finished');
@@ -111,6 +130,14 @@ export function useAudioGuidance({ onTextToken, enabled = true }: UseAudioGuidan
       },
     });
   };
+
+  const stopSpeaking = useCallback(() => {
+    Speech.stop();
+    isPlayingRef.current = false;
+    speechQueueRef.current = [];
+    textBuffer.reset();
+    setIsSpeaking(false);
+  }, [textBuffer]);
 
   // Handle complete sentences
   useEffect(() => {
@@ -133,16 +160,12 @@ export function useAudioGuidance({ onTextToken, enabled = true }: UseAudioGuidan
 
       const queuedSentence: QueuedSentence = { text: sentence, emergency };
 
-      if (emergency) {
-        // Emergency: stop current speech and jump to front
-        Speech.stop();
-        isPlayingRef.current = false;
-        speechQueueRef.current.unshift(queuedSentence);
-      } else {
-        speechQueueRef.current.push(queuedSentence);
-      }
+      // Always interrupt current speech to avoid backlog
+      Speech.stop();
+      isPlayingRef.current = false;
+      speechQueueRef.current = [queuedSentence];
 
-      console.log(`[AudioGuidance] Queue length: ${speechQueueRef.current.length}`);
+      console.log('[AudioGuidance] Interrupting and speaking latest sentence');
       playNextInQueue();
     });
   }, [textBuffer, isReady]);
@@ -172,5 +195,6 @@ export function useAudioGuidance({ onTextToken, enabled = true }: UseAudioGuidan
     isReady,
     isInitializing: false, // No initialization needed for native TTS
     error,
+    stopSpeaking,
   };
 }

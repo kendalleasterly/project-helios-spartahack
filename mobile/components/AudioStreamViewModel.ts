@@ -89,6 +89,7 @@ const DEFAULT_DEEPGRAM_CONFIG = {
   noDelay: true,
   keepAliveMs: 4000,
   enableKeepAlive: true,
+  keyterm: ["Helios"],
 };
 
 const sanitizeApiKey = (value: string): string => {
@@ -227,7 +228,6 @@ export const useAudioStreamViewModel = (): {
   const handleDeepgramEvent = (event: DeepgramEvent) => {
     switch (event.type) {
       case "open": {
-        console.log("Deepgram open");
         deepgramReadyRef.current = true;
         deepgramStartInFlightRef.current = false;
         setDeepgramStatus("open");
@@ -239,7 +239,6 @@ export const useAudioStreamViewModel = (): {
         break;
       }
       case "close": {
-        console.log("Deepgram closed", event.code, event.reason);
         deepgramReadyRef.current = false;
         deepgramClientRef.current = null;
         deepgramStartInFlightRef.current = false;
@@ -252,14 +251,12 @@ export const useAudioStreamViewModel = (): {
         break;
       }
       case "error": {
-        console.log("Deepgram error event", event.message);
         deepgramStartInFlightRef.current = false;
         setDeepgramStatus("error");
         setDeepgramError(event.message);
         break;
       }
       case "message": {
-        console.log("Deepgram message", event.raw);
         if (!event.parsed) {
           return;
         }
@@ -387,21 +384,13 @@ export const useAudioStreamViewModel = (): {
       const audioBuffer = bytes.slice().buffer;
 
       audioFrameLogRef.current += 1;
-      if (audioFrameLogRef.current <= 3 || audioFrameLogRef.current % 50 === 0) {
-        console.log("Deepgram audio frame", {
-          count: audioFrameLogRef.current,
-          sampleRate: frame.sampleRate,
-          bytes: bytes.byteLength,
-        });
-      }
 
       if (deepgramSampleRateRef.current === null) {
         deepgramSampleRateRef.current = frame.sampleRate;
         setDeepgramSampleRate(frame.sampleRate);
         deepgramPendingFramesRef.current.push(audioBuffer);
         if (!deepgramStartInFlightRef.current) {
-          startDeepgram(frame.sampleRate).catch((error) => {
-            console.warn("Deepgram start error", error);
+          startDeepgram(frame.sampleRate).catch(() => {
             setMicError("Failed to start Deepgram.");
             setStatus("error");
           });
@@ -414,9 +403,7 @@ export const useAudioStreamViewModel = (): {
         setDeepgramSampleRate(frame.sampleRate);
         deepgramPendingFramesRef.current = [audioBuffer];
         if (!deepgramStartInFlightRef.current) {
-          startDeepgram(frame.sampleRate).catch((error) => {
-            console.warn("Deepgram restart error", error);
-          });
+          startDeepgram(frame.sampleRate).catch(() => {});
         }
         return;
       }

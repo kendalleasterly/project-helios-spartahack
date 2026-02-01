@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import { io, Socket } from "socket.io-client";
 import { BACKEND_SERVER_URL } from "@env";
 
-const SERVER_URL = BACKEND_SERVER_URL || "http://192.168.137.1:8000";
+const SERVER_URL = BACKEND_SERVER_URL || "https://impolite-sky-noncontemplatively.ngrok-free.dev";
 console.log('WebSocket connecting to:', SERVER_URL);
 
 export type ConnectionStatus =
@@ -22,8 +22,7 @@ export type DeviceSensorPayload = {
   speed_avg_1s_mps: number;
   velocity_x_mps: number;
   velocity_z_mps: number;
-  magnetic_x_ut: number;
-  magnetic_z_ut: number;
+  heading_deg?: number | null;
   steps_last_3s: number;
   steps_since_open: number;
 };
@@ -36,6 +35,11 @@ interface TextResponseEvent {
 }
 
 export type TextTokenCallback = (event: TextTokenEvent) => void;
+export type HapticEvent = {
+  pattern: "burst" | "long-burst" | "heavy" | "warning" | "error" | string;
+  reason?: string;
+};
+export type HapticCallback = (event: HapticEvent) => void;
 
 export interface DetectedObject {
   label: string;
@@ -59,6 +63,7 @@ interface UseWebSocketReturn {
   sendFrame: (base64Frame: string, userQuestion?: string, debug?: boolean) => void;
   sendDeviceSensors: (payload: DeviceSensorPayload) => void;
   onTextToken: (callback: TextTokenCallback) => void;
+  onHaptic: (callback: HapticCallback) => void;
   detectionData: DetectionUpdateEvent | null;
   connect: () => void;
   disconnect: () => void;
@@ -69,6 +74,7 @@ export function useWebSocket(): UseWebSocketReturn {
   const [detectionData, setDetectionData] = useState<DetectionUpdateEvent | null>(null);
   const socketRef = useRef<Socket | null>(null);
   const textTokenCallbackRef = useRef<TextTokenCallback | null>(null);
+  const hapticCallbackRef = useRef<HapticCallback | null>(null);
 
   const connect = useCallback(() => {
     if (socketRef.current?.connected) {
@@ -150,6 +156,16 @@ export function useWebSocket(): UseWebSocketReturn {
       }
     });
 
+    // Listen for haptic alerts
+    socket.on("haptic", (data: HapticEvent) => {
+      console.log('[WebSocket] haptic received:', JSON.stringify(data));
+      if (hapticCallbackRef.current) {
+        hapticCallbackRef.current(data);
+      } else {
+        console.warn('[WebSocket] haptic received but no callback registered');
+      }
+    });
+
     // Log all events for debugging - helps identify what backend is sending
     socket.onAny((eventName: string, ...args: unknown[]) => {
       if (eventName !== 'text_token' && eventName !== 'text_response' && 
@@ -171,18 +187,11 @@ export function useWebSocket(): UseWebSocketReturn {
 
   const sendFrame = useCallback((base64Frame: string, userQuestion?: string, debug = false) => {
     if (socketRef.current?.connected) {
-      if (userQuestion) {
-        console.log(`Sending frame with question to backend: "${userQuestion}"`);
-      } else {
-        console.log(`Sending frame to backend (${base64Frame.length} bytes)`);
-      }
       socketRef.current.emit("video_frame_streaming", {
         frame: base64Frame,
         user_question: userQuestion,
         debug,
       });
-    } else {
-      console.warn('Cannot send frame: socket not connected');
     }
   }, []);
 
@@ -194,6 +203,10 @@ export function useWebSocket(): UseWebSocketReturn {
 
   const onTextToken = useCallback((callback: TextTokenCallback) => {
     textTokenCallbackRef.current = callback;
+  }, []);
+
+  const onHaptic = useCallback((callback: HapticCallback) => {
+    hapticCallbackRef.current = callback;
   }, []);
 
   useEffect(() => {
@@ -208,6 +221,7 @@ export function useWebSocket(): UseWebSocketReturn {
     sendFrame,
     sendDeviceSensors,
     onTextToken,
+    onHaptic,
     detectionData,
     connect,
     disconnect,

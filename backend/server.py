@@ -31,6 +31,7 @@ from PIL import Image
 from ultralytics import YOLO
 
 from contextual_gemini_service import BlindAssistantService, ContextConfig
+from heuristics import UrgencyLevel
 
 # Load environment variables
 load_dotenv()
@@ -300,8 +301,7 @@ async def device_sensor_stream(sid, data):
         "speed_avg_1s_mps": data.get("speed_avg_1s_mps"),
         "velocity_x_mps": data.get("velocity_x_mps"),
         "velocity_z_mps": data.get("velocity_z_mps"),
-        "magnetic_x_ut": data.get("magnetic_x_ut"),
-        "magnetic_z_ut": data.get("magnetic_z_ut"),
+        "heading_deg": data.get("heading_deg"),
         "steps_last_3s": data.get("steps_last_3s"),
         "steps_since_open": data.get("steps_since_open"),
     }
@@ -350,6 +350,10 @@ async def video_frame_streaming(sid, data):
             "motion": {**sensor, "is_moving": is_moving}
         }
 
+        if assistant:
+            assistant.latest_frame = base64_frame
+            assistant.latest_yolo = yolo_results
+
         if user_question:
             async with gemini_vision_lock:
                 resp = await assistant.process_user_speech(user_question)
@@ -357,7 +361,19 @@ async def video_frame_streaming(sid, data):
         else:
             resp = await assistant.process_frame(base64_frame, yolo_results)
             if resp:
-                await sio.emit('text_response', {'text': resp, 'mode': 'vision', 'emergency': "STOP" in resp}, room=sid)
+                nav_active = bool(getattr(assistant, "navigation_state", None) and assistant.navigation_state.active)
+                last_urgency = getattr(assistant, "last_vision_urgency", None)
+                if nav_active and last_urgency in (UrgencyLevel.URGENT, UrgencyLevel.ALERT):
+                    await sio.emit(
+                        'haptic',
+                        {
+                            'pattern': 'burst',
+                            'reason': getattr(assistant, "last_vision_reason", "") or "",
+                        },
+                        room=sid
+                    )
+                else:
+                    await sio.emit('text_response', {'text': resp, 'mode': 'vision', 'emergency': "STOP" in resp}, room=sid)
                 
                 # Save debug frame ONLY if a warning/response was triggered
                 if SAVE_DEBUG_FRAMES:

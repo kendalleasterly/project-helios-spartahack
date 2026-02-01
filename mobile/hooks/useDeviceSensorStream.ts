@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { DeviceMotion, Magnetometer, Pedometer } from "expo-sensors";
+import { DeviceMotion, Pedometer } from "expo-sensors";
+import * as Location from "expo-location";
 import type { DeviceSensorPayload } from "./useWebSocket";
 
 type UseDeviceSensorStreamOptions = {
@@ -53,14 +54,23 @@ const computeAverages = (
 const sanitizeValue = (value: number | null | undefined): number =>
   Number.isFinite(value) ? (value as number) : 0;
 
+const resolveHeadingDeg = (heading: Location.LocationHeadingObject) => {
+  if (typeof heading.trueHeading === "number" && heading.trueHeading >= 0) {
+    return heading.trueHeading;
+  }
+  if (typeof heading.magHeading === "number") {
+    return heading.magHeading;
+  }
+  return null;
+};
+
 export const useDeviceSensorStream = ({
   enabled,
   updateIntervalMs = 50,
 }: UseDeviceSensorStreamOptions) => {
   const velocityRef = useRef({ dx: 0, dz: 0 });
   const lastTRef = useRef<number | null>(null);
-  const magnetometerXRef = useRef(0);
-  const magnetometerZRef = useRef(0);
+  const rotationBetaRef = useRef(0);
   const stepsSinceOpenRef = useRef(0);
   const lastStepsRef = useRef<number | null>(null);
   const stepsWindowRef = useRef<Array<{ t: number; count: number }>>([]);
@@ -68,6 +78,7 @@ export const useDeviceSensorStream = ({
     Array<{ t: number; vx: number; vz: number; speed: number }>
   >([]);
   const speedAvg1sRef = useRef(0);
+  const headingRef = useRef<number | null>(null);
   const [speedMps, setSpeedMps] = useState(0);
 
   useEffect(() => {
@@ -77,9 +88,8 @@ export const useDeviceSensorStream = ({
 
     let motionSubscription: ReturnType<typeof DeviceMotion.addListener> | null =
       null;
-    let magnetometerSubscription: ReturnType<typeof Magnetometer.addListener> | null =
-      null;
     let pedometerSubscription: { remove: () => void } | null = null;
+    let headingSubscription: Location.LocationSubscription | null = null;
     let isMounted = true;
 
     const start = async () => {
@@ -98,27 +108,11 @@ export const useDeviceSensorStream = ({
         }
       }
 
-      const magnetometerAvailable = await Magnetometer.isAvailableAsync();
-      if (!magnetometerAvailable) {
-        console.warn("Magnetometer not available on this device.");
-      } else {
-        const magnetometerPermission = await Magnetometer.getPermissionsAsync();
-        if (!magnetometerPermission.granted) {
-          const request = await Magnetometer.requestPermissionsAsync();
-          if (!request.granted) {
-            console.warn("Magnetometer permission not granted.");
-          }
-        }
-      }
-
       if (!isMounted) {
         return;
       }
 
       DeviceMotion.setUpdateInterval(updateIntervalMs);
-      if (magnetometerAvailable) {
-        Magnetometer.setUpdateInterval(updateIntervalMs);
-      }
 
       const pedometerAvailable = await Pedometer.isAvailableAsync();
       if (!pedometerAvailable) {
@@ -159,11 +153,18 @@ export const useDeviceSensorStream = ({
         }
       }
 
-      if (magnetometerAvailable) {
-        magnetometerSubscription = Magnetometer.addListener((measurement) => {
-          magnetometerXRef.current = Math.round(sanitizeValue(measurement.x));
-          magnetometerZRef.current = Math.round(sanitizeValue(measurement.z));
-        });
+      try {
+        const permission = await Location.requestForegroundPermissionsAsync();
+        if (!isMounted) {
+          return;
+        }
+        if (permission.status === "granted") {
+          headingSubscription = await Location.watchHeadingAsync((heading) => {
+            headingRef.current = resolveHeadingDeg(heading);
+          });
+        }
+      } catch (error) {
+        headingRef.current = null;
       }
 
       motionSubscription = DeviceMotion.addListener(
@@ -209,10 +210,12 @@ export const useDeviceSensorStream = ({
             sanitizeValue(acceleration.y),
             sanitizeValue(acceleration.z)
           );
+          const rotationBeta = sanitizeValue(rotationRate?.beta);
+          rotationBetaRef.current = rotationBeta;
           const rMag = rotationRate
             ? Math.hypot(
                 sanitizeValue(rotationRate.alpha),
-                sanitizeValue(rotationRate.beta),
+                rotationBeta,
                 sanitizeValue(rotationRate.gamma)
               )
             : 0;
@@ -250,11 +253,11 @@ export const useDeviceSensorStream = ({
       if (motionSubscription) {
         motionSubscription.remove();
       }
-      if (magnetometerSubscription) {
-        magnetometerSubscription.remove();
-      }
       if (pedometerSubscription) {
         pedometerSubscription.remove();
+      }
+      if (headingSubscription) {
+        headingSubscription.remove();
       }
     };
   }, [enabled, updateIntervalMs]);
@@ -276,8 +279,7 @@ export const useDeviceSensorStream = ({
       speed_avg_1s_mps: speedAvg1sRef.current,
       velocity_x_mps: dx,
       velocity_z_mps: dz,
-      magnetic_x_ut: magnetometerXRef.current,
-      magnetic_z_ut: magnetometerZRef.current,
+      heading_deg: headingRef.current,
       steps_last_3s: stepsLast3s,
       steps_since_open: stepsSinceOpenRef.current,
     };

@@ -21,40 +21,31 @@ from heuristics import evaluate_scene, UrgencyLevel, SpeakDecision, HeuristicsCo
 
 load_dotenv()
 
-VISION_SYSTEM_PROMPT = """You are a proactive navigation guide for a blind person. Your job is to keep them SAFE and help them NAVIGATE. You see through their camera.
+VISION_SYSTEM_PROMPT = """You are a proactive navigation guide for a blind person. Your job is to help them NAVIGATE. You see through their camera.
 You receive:
 1. Camera image
 2. YOLO detections with positions (left/center/right) and distances (immediate/close/far)
 3. Recent history (what you've said in the last 10 seconds)
 4. Motion/sensor telemetry (per-frame):
    - speed_mps, speed_avg_1s_mps, velocity_x_mps, velocity_z_mps
-   - magnetic_x_ut, magnetic_z_ut
+   - heading_deg (absolute heading in degrees, true if available)
    - steps_last_3s, steps_since_open, is_moving (if provided)
 
 Treat the user as MOVING if speed_mps ≥ 0.2 OR steps_last_3s ≥ 1 (or is_moving is true).
 If recent history shows consistent scene shift between frames, assume MOVING.
 
 ## WHEN TO SPEAK (be proactive!)
-ALWAYS speak for:
-- ANY object at "immediate" distance (< 3 feet)
-- Obstacles in the center of frame (they're walking toward it)
-- People approaching or in their path
-- Hazards: stairs, curbs, vehicles, wet floors, doors opening
-
-When MOVING (speed high or steps detected), be EXTRA proactive:
-- Call out any obstacles in the walking path even if only "close" or "medium"
-- Mention low, trip, or collision hazards early (chairs, tables, poles, bikes, stairs)
-- Prefer safety over silence — avoid missing obstacles
-
+Focus ONLY on navigation cues and wayfinding context.
+Do NOT announce obstacles or collision warnings (handled by another channel).
 SPEAK for:
-- New objects that could help (chairs, doors, handrails)
-- Path guidance ("clear ahead", "veer left")
-- Significant scene changes (new room, outdoor→indoor)
-
-STAY SILENT only when:
-- Path is clear AND no new close objects AND you just spoke about this scene
+- Route guidance ("clear ahead", "veer left", "door ahead")
+- Navigation-relevant landmarks (doors, stairs, elevators, room numbers, exits)
+- Significant scene changes that affect navigation
+STAY SILENT when:
+- Nothing navigation-relevant has changed
 
 ## HOW TO SPEAK (be actionable!)
+Be VERY brief. Prefer 5-10 words, max 15 words unless navigation requires more.
 Give INSTRUCTIONS, not descriptions:
 - ❌ "There is a chair on your left" 
 - ✅ "Chair left, 4 feet. Keep right to pass."
@@ -72,20 +63,18 @@ Use this format:
 
 ## OUTPUT FORMAT
 
-Start EVERY response with "SPEAK: " or "SILENT: " (required).
-
-SPEAK examples:
-- "SPEAK: Chair left. Keep right."
-- "SPEAK: Clear path. Door at end of hall."
-- "SPEAK: Person approaching from right. Hold position."
-
-SILENT example:
-- "SILENT: Same hallway, clear path, no changes."
+Do NOT include any prefixes like "SPEAK:" or "SILENT:".
+Respond with the spoken guidance only.
 
 ## NAVIGATION MODE (when navigation state is active)
 - Use a structured loop: DISCOVER → if goal not found, CHANGE STATE (turn/move) → DISCOVER.
 - If goal is found, give a short plan with spatial cues.
 - While moving, keep giving brief safety and environment updates.
+- If navigation is active, provide a concise update about environment + next action at least every 10 seconds.
+- In discovery mode, keep prompting the user to change perspective until the goal is found or you have clearly searched the space.
+- If NAVIGATION STATE shows cue_due=true, provide an update now.
+ - When giving direction or planning steps, include an absolute direction using heading_deg if available
+   (e.g., "Turn to 090° East", "Walk heading 315° NW"). Use plain N/NE/E/SE/S/SW/W/NW plus degrees.
 
 ## KEY MINDSET
 
@@ -110,10 +99,12 @@ You receive:
 
 CRITICAL RULES:
 - ALWAYS respond to the user's question - NEVER stay silent
-- Be concise (under 30 words unless the question requires detail)
+- Be VERY brief. Prefer 5-10 words, max 15 words unless navigation requires more.
 - Be direct and helpful
 - Use spatial language: "left", "right", "ahead", "behind", "close", "far"
 - If you can't answer from the image, say so briefly
+- Do NOT announce obstacles or collision warnings (handled by another channel).
+  Focus on navigation cues and wayfinding context instead.
 
 ## NAVIGATION MODE (when the user asks to go somewhere)
 - Enter and persist navigation mode when the user asks to go/find a destination.
@@ -121,9 +112,19 @@ CRITICAL RULES:
   1) DISCOVER: scan and describe what you can see related to the goal
   2) If goal not found, CHANGE STATE: ask the user to turn or move to a new view
   3) Repeat DISCOVER until the goal is found
+- If you are in DISCOVERY, be persistent: keep asking the user to turn/move for new perspectives until the goal is found or you have clearly searched the space.
+- If you cannot find the goal after multiple perspective changes, say you cannot see it yet and suggest a new search direction.
 - Once the goal is found, create a plan (micro-steps if the path is only partially visible).
+- Plans must be very directional. Each step should include a direction like:
+  "left", "right", "slight left", "slight right", "straight", "turn around".
+- When giving directions or plan steps, include absolute heading using heading_deg if available
+  (e.g., "Turn to 090° East", "Walk heading 315° NW"). Use plain N/NE/E/SE/S/SW/W/NW plus degrees.
 - While executing a plan, keep giving short safety cues and environment updates.
 - Keep responses concise, but allow extra words when giving step-by-step guidance.
+- If navigation is active, provide a concise update about environment + next action at least every 10 seconds.
+- If NAVIGATION STATE shows cue_due=true, provide an update now.
+If the objective was found earlier and is now out of view, do NOT complain or restart. Trust the plan and keep guiding.
+If the objective has been found, include found_objective=true in the nav_state block.
 
 ## NAVIGATION STATE (metadata output)
 You may receive a navigation state in the prompt with the current objective/phase/plan.
@@ -132,6 +133,14 @@ If navigation is active or requested, append a metadata block AFTER your spoken 
 - Do NOT speak the <nav_state> block.
 - Keep plan short (1-4 steps). Clear plan to [] once that step is done or you need a new plan.
 - Set active=false and phase="complete" when the user reaches the goal or cancels.
+- When you have found the objective (even if it goes out of view), set "found_objective": true and keep it true.
+
+## RESPONSE SCOPE (important)
+Decide if the user's question is relevant to:
+- The environment (what you see around the user)
+- The person in view (recognize/describe if possible)
+- Navigation goals or navigation cues
+If not relevant, reply briefly: "I can help with surroundings, people, and navigation."
 
 OUTPUT FORMAT:
 - DO NOT use any prefix
@@ -172,6 +181,8 @@ class NavigationState:
     phase: str = "idle"  # idle | explore | plan | execute | complete
     plan: List[str] = field(default_factory=list)
     last_update_ts: float = 0.0
+    last_cue_ts: float = 0.0
+    objective_confirmed: bool = False
 
 
 class GeminiContextualNarrator:
@@ -245,11 +256,10 @@ class GeminiContextualNarrator:
                 "speed_avg_1s_mps",
                 "velocity_x_mps",
                 "velocity_z_mps",
-                "magnetic_x_ut",
-                "magnetic_z_ut",
                 "steps_last_3s",
                 "steps_since_open",
                 "is_moving",
+                "heading_deg",
             ):
                 if key in motion:
                     value = motion.get(key)
@@ -266,6 +276,10 @@ class GeminiContextualNarrator:
             phase = navigation_state.get("phase")
             plan = navigation_state.get("plan") or []
             plan_age = navigation_state.get("last_update_s_ago")
+            cue_due = navigation_state.get("cue_due")
+            cue_every_s = navigation_state.get("cue_every_s")
+            cue_age = navigation_state.get("last_cue_s_ago")
+            objective_confirmed = navigation_state.get("objective_confirmed")
 
             if objective:
                 parts.append(f"   Objective: {objective}")
@@ -275,6 +289,14 @@ class GeminiContextualNarrator:
                 parts.append(f"   Plan: {' | '.join(plan)}")
             if plan_age is not None:
                 parts.append(f"   Plan age: {plan_age}s")
+            if cue_every_s is not None:
+                parts.append(f"   Cue interval: {cue_every_s}s")
+            if cue_due is not None:
+                parts.append(f"   Cue due: {cue_due}")
+            if cue_age is not None:
+                parts.append(f"   Last cue: {cue_age}s ago")
+            if objective_confirmed is not None:
+                parts.append(f"   Objective confirmed: {objective_confirmed}")
 
         # Emergency flag
         if emergency:
@@ -332,10 +354,22 @@ class GeminiContextualNarrator:
         """
         start_time = time.perf_counter()
 
+        import logging
+        logger = logging.getLogger(__name__)
+
         # Build prompt
         context_prompt = self._build_context_prompt(scene_analysis, user_question)
         image_bytes = self._decode_image(image_base64)
         image_part = Part.from_bytes(data=image_bytes, mime_type="image/jpeg")
+
+        motion_line = next(
+            (line for line in context_prompt.splitlines() if line.startswith("📟 MOTION:")),
+            None,
+        )
+        if motion_line:
+            logger.info(f"📨 GEMINI PROMPT | {motion_line}")
+        else:
+            logger.info("📨 GEMINI PROMPT | No motion line included")
 
         # Build messages with history
         messages = []
@@ -368,9 +402,6 @@ class GeminiContextualNarrator:
 
         first_chunk_time = None
         full_response = ""
-
-        import logging
-        logger = logging.getLogger(__name__)
 
         try:
             chunk_count = 0
@@ -406,8 +437,6 @@ class GeminiContextualNarrator:
         end_time = time.perf_counter()
 
         # Debug logging - show raw Gemini response
-        import logging
-        logger = logging.getLogger(__name__)
         logger.info(f"🔍 RAW GEMINI | Full response with prefix: '{full_response}'")
 
         # Update history
@@ -550,16 +579,44 @@ class BlindAssistantService:
 
         # Persistent navigation state
         self.navigation_state = NavigationState()
+        self.navigation_cue_interval_s = 10.0
+        self.last_vision_urgency: Optional[UrgencyLevel] = None
+        self.last_vision_reason: Optional[str] = None
 
     _NAV_STATE_PATTERN = re.compile(r"<nav_state>(.*?)</nav_state>", re.IGNORECASE | re.DOTALL)
 
-    def _reset_navigation_state(self):
+    def _log_navigation_state(self, context: str):
+        """Log current navigation state for debugging."""
+        import logging
+        logger = logging.getLogger(__name__)
+        last_update_s_ago = None
+        if self.navigation_state.last_update_ts:
+            last_update_s_ago = int(time.time() - self.navigation_state.last_update_ts)
+        last_cue_s_ago = None
+        if self.navigation_state.last_cue_ts:
+            last_cue_s_ago = int(time.time() - self.navigation_state.last_cue_ts)
+        logger.info(
+            "🧭 NAV STATE | %s | active=%s | objective=%s | phase=%s | plan=%s | last_update_s_ago=%s | last_cue_s_ago=%s",
+            context,
+            self.navigation_state.active,
+            self.navigation_state.objective,
+            self.navigation_state.phase,
+            self.navigation_state.plan[:4],
+            last_update_s_ago,
+            last_cue_s_ago
+        )
+
+    def _reset_navigation_state(self, log_context: Optional[str] = "reset"):
         """Clear navigation state."""
         self.navigation_state.active = False
         self.navigation_state.objective = None
         self.navigation_state.phase = "idle"
         self.navigation_state.plan = []
         self.navigation_state.last_update_ts = time.time()
+        self.navigation_state.last_cue_ts = 0.0
+        self.navigation_state.objective_confirmed = False
+        if log_context:
+            self._log_navigation_state(log_context)
 
     def _start_navigation(self, objective: str):
         """Start or update navigation with a new objective."""
@@ -568,87 +625,39 @@ class BlindAssistantService:
         self.navigation_state.phase = "explore"
         self.navigation_state.plan = []
         self.navigation_state.last_update_ts = time.time()
+        self.navigation_state.last_cue_ts = 0.0
+        self.navigation_state.objective_confirmed = False
+        self._log_navigation_state("start")
 
-    def _is_navigation_cancel(self, user_question: str) -> bool:
-        """Check if the user is cancelling navigation."""
-        text = user_question.lower()
-        cancel_phrases = [
-            "cancel navigation",
-            "stop navigation",
-            "end navigation",
-            "cancel that",
-            "never mind",
-            "nevermind",
-            "forget it",
-            "stop guiding",
-            "stop guidance",
-        ]
-        return any(phrase in text for phrase in cancel_phrases)
-
-    def _is_navigation_request(self, user_question: str) -> bool:
-        """Heuristic check for navigation intent."""
-        text = user_question.lower()
-        patterns = [
-            r"\b(navigate|navigation)\b",
-            r"\b(go|get|head|walk|move|lead|take)\s+(me\s+)?to\b",
-            r"\bfind\b",
-            r"\blocate\b",
-            r"\blook for\b",
-            r"\bwhere\s+is\b",
-            r"\bwhere's\b",
-            r"\bexit\b",
-            r"\bleave\b",
-            r"\bget out\b",
-        ]
-        return any(re.search(pattern, text) for pattern in patterns)
-
-    def _extract_navigation_objective(self, user_question: str) -> str:
-        """Extract a concise navigation target from the user's request."""
-        text = user_question.strip()
-        patterns = [
-            r"\b(?:go|get|head|walk|move|lead|take)\s+(?:me\s+)?to\s+(.+)",
-            r"\b(?:navigate|navigation)\s+to\s+(.+)",
-            r"\b(?:find|locate|look for)\s+(.+)",
-            r"\bwhere\s+is\s+(.+)",
-            r"\bwhere's\s+(.+)",
-            r"\bexit\s+(.+)",
-            r"\bleave\s+(.+)",
-            r"\bget out(?: of)?\s+(.+)",
-        ]
-        for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
-            if match:
-                objective = match.group(1)
-                return objective.strip(" .,!?:;\"'").strip()
-        return text.strip(" .,!?:;\"'").strip()
-
-    def _handle_navigation_intent(self, user_question: str):
-        """Update navigation state based on the current user request."""
-        if not user_question:
-            return
-        if self._is_navigation_cancel(user_question):
-            self._reset_navigation_state()
-            return
-        if self._is_navigation_request(user_question):
-            objective = self._extract_navigation_objective(user_question)
-            if (not self.navigation_state.active) or (objective != self.navigation_state.objective):
-                self._start_navigation(objective)
-            else:
-                self.navigation_state.last_update_ts = time.time()
+    def _navigation_cue_due(self, now: Optional[float] = None) -> bool:
+        """Check whether a navigation cue is due based on interval."""
+        if not self.navigation_state.active:
+            return False
+        if now is None:
+            now = time.time()
+        last_cue = self.navigation_state.last_cue_ts or 0.0
+        return (now - last_cue) >= self.navigation_cue_interval_s
 
     def _navigation_prompt_payload(self) -> Optional[Dict[str, Any]]:
         """Build navigation state payload for prompt injection."""
         # TODO: consider programmatic cue cadence (e.g., every 3s or 3 steps) if needed.
         if not self.navigation_state.active:
             return None
+        now = time.time()
         payload: Dict[str, Any] = {
             "active": True,
             "objective": self.navigation_state.objective,
             "phase": self.navigation_state.phase,
             "plan": self.navigation_state.plan[:4],
+            "cue_every_s": int(self.navigation_cue_interval_s),
+            "cue_due": self._navigation_cue_due(now),
+            "objective_confirmed": self.navigation_state.objective_confirmed,
+            "found_objective": self.navigation_state.objective_confirmed,
         }
         if self.navigation_state.last_update_ts:
-            payload["last_update_s_ago"] = int(time.time() - self.navigation_state.last_update_ts)
+            payload["last_update_s_ago"] = int(now - self.navigation_state.last_update_ts)
+        if self.navigation_state.last_cue_ts:
+            payload["last_cue_s_ago"] = int(now - self.navigation_state.last_cue_ts)
         return payload
 
     def _strip_code_fence(self, text: str) -> str:
@@ -683,8 +692,9 @@ class BlindAssistantService:
         phase = nav_update.get("phase")
 
         if active is False or phase == "complete":
-            self._reset_navigation_state()
+            self._reset_navigation_state(log_context=None)
             self.navigation_state.phase = "complete"
+            self._log_navigation_state("model_complete")
             return
 
         if active is True:
@@ -707,7 +717,15 @@ class BlindAssistantService:
                 cleaned_plan = [str(step).strip() for step in plan if str(step).strip()]
                 self.navigation_state.plan = cleaned_plan[:4]
 
+        found_objective = nav_update.get("found_objective")
+        if isinstance(found_objective, bool):
+            self.navigation_state.objective_confirmed = found_objective
+        elif self.navigation_state.plan:
+            # Plan implies we found a path to the objective.
+            self.navigation_state.objective_confirmed = True
+
         self.navigation_state.last_update_ts = time.time()
+        self._log_navigation_state("model_update")
 
     async def process_frame(
         self,
@@ -763,60 +781,76 @@ class BlindAssistantService:
         )
         self.scene_history.append(snapshot)
 
-        # If heuristics say don't speak, stay silent (no Gemini call)
-        if not decision.should_speak:
+        navigation_cue_due = self._navigation_cue_due(current_time)
+        self.last_vision_urgency = None
+        self.last_vision_reason = None
+
+        def record_fast_path_response(raw_text: str, urgency: UrgencyLevel) -> str:
+            response_text = raw_text
+
+            # Simple cleanup for common patterns
+            if response_text.startswith("Immediate:"):
+                response_text = f"Careful! {response_text[10:].strip()}."
+            elif response_text.startswith("New:"):
+                # Make "New: person" sound more natural -> "Person."
+                response_text = response_text[5:].strip()
+            elif response_text.startswith("Path blocked:"):
+                # "Path blocked: chair" -> "Chair in path."
+                response_text = response_text.replace("Path blocked:", "").strip() + " in path."
+
+            self.last_spoke_time = current_time
+            self.last_vision_urgency = urgency
+            self.last_vision_reason = raw_text
+            if self.navigation_state.active:
+                if urgency in (UrgencyLevel.URGENT, UrgencyLevel.ALERT):
+                    self._log_navigation_state("fast_path_alert")
+                else:
+                    self.navigation_state.last_cue_ts = current_time
+                    self._log_navigation_state("fast_path_cue")
+
+            # Update history with what we are about to say
+            self.scene_history[-1] = SceneSnapshot(
+                timestamp=current_time,
+                yolo_objects=yolo_objects,
+                scene_description=response_text,
+                frame_base64=frame_base64 if self.config.store_frames else None
+            )
+
+            # Also manually add to narrator history so Gemini knows we said it next time
+            # (Mocking a model turn)
+            self.vision_narrator._add_to_history("user", "System Event: Heuristics triggered warning.")
+            self.vision_narrator._add_to_history("model", f"SPEAK: {response_text}")
+
+            return response_text
+
+        # If heuristics say don't speak and no navigation cue is due, stay silent
+        if not decision.should_speak and not navigation_cue_due:
             return None
 
-        # Heuristics triggered: call Gemini with urgency context
-        logger.info(f"🔊 VISION SPEAKING | Urgency: {decision.urgency.value}")
+        # Always fast-path urgent alerts to keep latency minimal
+        if decision.should_speak and decision.urgency in (UrgencyLevel.URGENT, UrgencyLevel.ALERT):
+            logger.info(f"🚀 FAST PATH: Urgent {decision.urgency.name} message")
+            return record_fast_path_response(decision.reason, decision.urgency)
 
-        # CRITICAL OPTIMIZATION: Bypass Gemini for ALL heuristic triggers
-        # We want zero latency for all proactive guidance, not just emergencies.
-        # Gemini is only used for answering user questions in conversation mode.
-        logger.info(f"🚀 FAST PATH: Skipping Gemini for {decision.urgency.name} message")
-        
-        # Use the heuristic reason directly as the speech output
-        # Clean up the text if needed (e.g. "Immediate: door" -> "Head's up, door nearby")
-        response_text = decision.reason
-        
-        # Simple cleanup for common patterns
-        if response_text.startswith("Immediate:"):
-            response_text = f"Careful! {response_text[10:].strip()}."
-        elif response_text.startswith("New:"):
-            # Make "New: person" sound more natural -> "Person."
-            response_text = response_text[5:].strip()
-        elif response_text.startswith("Path blocked:"):
-             # "Path blocked: chair" -> "Chair in path."
-             response_text = response_text.replace("Path blocked:", "").strip() + " in path."
-            
-        self.last_spoke_time = current_time
-        
-        # Update history with what we are about to say
-        self.scene_history[-1] = SceneSnapshot(
-            timestamp=current_time,
-            yolo_objects=yolo_objects,
-            scene_description=response_text,
-            frame_base64=frame_base64 if self.config.store_frames else None
-        )
-        
-        # Also manually add to narrator history so Gemini knows we said it next time
-        # (Mocking a model turn)
-        self.vision_narrator._add_to_history("user", "System Event: Heuristics triggered warning.")
-        self.vision_narrator._add_to_history("model", f"SPEAK: {response_text}")
-        
-        return response_text
+        # If navigation cue is not due, use fast path for non-urgent heuristic messages
+        if decision.should_speak and not navigation_cue_due:
+            logger.info(f"🚀 FAST PATH: {decision.urgency.name} message")
+            return record_fast_path_response(decision.reason, decision.urgency)
 
-        # (Code below is now unreachable in normal flow but kept structure)
+        # Navigation cue due: call Gemini for structured update
+        logger.info("🧭 NAV CUE DUE | Calling Gemini for structured navigation update")
+
         # Build scene analysis with urgency context for Gemini
         scene_with_urgency = {
             **yolo_objects,
             "urgency_level": decision.urgency.value.upper(),
-            "urgency_reason": decision.reason,
+            "urgency_reason": decision.reason if decision.should_speak else "Navigation cue due",
             "recent_history": self._build_vision_history_context()
         }
         navigation_payload = self._navigation_prompt_payload()
         if navigation_payload:
             scene_with_urgency["navigation_state"] = navigation_payload
+            self._log_navigation_state("prompt_inject_vision")
 
         # Call Gemini vision narrator
         response = await self.vision_narrator.process_input(
@@ -828,6 +862,11 @@ class BlindAssistantService:
         # Update last spoke time
         if response.full_text:
             self.last_spoke_time = current_time
+            self.last_vision_urgency = UrgencyLevel.INFO
+            self.last_vision_reason = "Navigation cue"
+            if self.navigation_state.active:
+                self.navigation_state.last_cue_ts = current_time
+                self._log_navigation_state("vision_cue")
             # Update the snapshot with actual Gemini response
             self.scene_history[-1] = SceneSnapshot(
                 timestamp=current_time,
@@ -858,9 +897,6 @@ class BlindAssistantService:
 
         logger.info(f"💬 CONVERSATION PIPELINE | Question: '{user_question}'")
 
-        # Update navigation state from user intent (start/stop)
-        self._handle_navigation_intent(user_question)
-
         if not self.latest_frame:
             logger.warning("⚠️ No latest frame available yet")
             return "I haven't seen anything yet. Please wait a moment."
@@ -878,9 +914,13 @@ class BlindAssistantService:
             "objects": self.latest_yolo.get("objects", []) if self.latest_yolo else [],
             "emergency_stop": False  # User questions aren't emergencies
         }
+        motion = self.latest_yolo.get("motion") if self.latest_yolo else None
+        if motion:
+            scene_analysis["motion"] = motion
         navigation_payload = self._navigation_prompt_payload()
         if navigation_payload:
             scene_analysis["navigation_state"] = navigation_payload
+            self._log_navigation_state("prompt_inject")
         logger.info(f"📊 Scene analysis | Objects: {len(scene_analysis['objects'])}")
 
         # Conversation model gets vision context + question
@@ -896,6 +936,9 @@ class BlindAssistantService:
         spoken_text, nav_update = self._extract_nav_state_block(response.full_text)
         if nav_update:
             self._apply_navigation_update(nav_update)
+        if spoken_text and self.navigation_state.active:
+            self.navigation_state.last_cue_ts = time.time()
+            self._log_navigation_state("conversation_cue")
         return spoken_text
 
     def _build_vision_history_context(self) -> str:

@@ -17,7 +17,8 @@
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false,
         "NSMicrophoneUsageDescription": "A-eye needs microphone access to stream audio.",
-        "NSCameraUsageDescription": "Helios needs camera access to provide visual guidance and navigation assistance."
+        "NSCameraUsageDescription": "Helios needs camera access to provide visual guidance and navigation assistance.",
+        "NSLocationWhenInUseUsageDescription": "Helios uses your location to provide device heading for navigation diagnostics."
       }
     },
     "android": {
@@ -32,7 +33,8 @@
       "permissions": [
         "android.permission.CAMERA",
         "android.permission.RECORD_AUDIO",
-        "android.permission.MODIFY_AUDIO_SETTINGS"
+        "android.permission.MODIFY_AUDIO_SETTINGS",
+        "android.permission.ACCESS_FINE_LOCATION"
       ],
       "package": "com.aeye.aeye"
     },

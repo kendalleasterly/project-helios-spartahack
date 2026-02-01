@@ -16,6 +16,7 @@ export type DeepgramConfig = {
   keepAliveMs: number;
   enableKeepAlive: boolean;
   authMode: DeepgramAuthMode;
+  keyterm?: string[];
 };
 
 export type DeepgramEvent =
@@ -52,6 +53,10 @@ const buildDeepgramUrl = (config: DeepgramConfig): string => {
 
   if (config.authMode === "token") {
     params.set("token", config.apiKey);
+  }
+
+  if (config.keyterm && config.keyterm.length > 0) {
+    config.keyterm.forEach((term) => params.append("keyterm", term));
   }
 
   return `wss://api.deepgram.com/v1/listen?${params.toString()}`;

@@ -15,7 +15,9 @@ import {
   Text,
   View,
 } from "react-native";
+import { useEffect, useState } from "react";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import * as Location from "expo-location";
 
 type StatusMeta = {
   label: string;
@@ -101,6 +103,33 @@ const getTTSStatusMeta = (tts?: TTSStatus): StatusMeta => {
   return { label: "TTS Idle", color: "#64748B", bg: "#F1F5F9" };
 };
 
+const formatHeadingValue = (value?: number | null) => {
+  if (typeof value !== "number" || Number.isNaN(value)) return "—";
+  return `${value.toFixed(1)}°`;
+};
+
+const getCardinalDirection = (heading: number) => {
+  const normalized = ((heading % 360) + 360) % 360;
+  const directions = ["N", "NE", "E", "SE", "S", "SW", "W", "NW", "N"];
+  const index = Math.round(normalized / 45);
+  return directions[index];
+};
+
+const getHeadingAccuracyLabel = (accuracy?: number | null) => {
+  switch (accuracy) {
+    case 3:
+      return "High";
+    case 2:
+      return "Medium";
+    case 1:
+      return "Low";
+    case 0:
+      return "Unreliable";
+    default:
+      return "Unknown";
+  }
+};
+
 export const AudioStreamView = ({
   onFinalizeNote,
   onCancelNote,
@@ -124,7 +153,12 @@ export const AudioStreamView = ({
   const frameSampleRate = state.lastFrame ? state.lastFrame.sampleRate : null;
   const diagnosticsLabel = isDiagnosticsVisible
     ? "Hide Diagnostics"
-    : "Audio Diagnostics";
+    : "Diagnostics";
+  const [heading, setHeading] = useState<Location.LocationHeadingObject | null>(null);
+  const [headingPermission, setHeadingPermission] = useState<
+    Location.LocationPermissionResponse["status"] | "unknown"
+  >("unknown");
+  const [headingError, setHeadingError] = useState<string | null>(null);
   const modalContentInsetStyle = {
     paddingBottom: Math.max(insets.bottom, 32),
   };
@@ -135,6 +169,62 @@ export const AudioStreamView = ({
 
   // Instantaneous speed from backend detection data
   const instantSpeed = detectionData?.motion?.speed_mps;
+
+  useEffect(() => {
+    let subscription: Location.LocationSubscription | null = null;
+    let isActive = true;
+
+    const startHeading = async () => {
+      if (!isDiagnosticsVisible) {
+        return;
+      }
+
+      try {
+        setHeadingError(null);
+        const permission = await Location.requestForegroundPermissionsAsync();
+        if (!isActive) return;
+        setHeadingPermission(permission.status);
+        if (permission.status !== "granted") {
+          setHeadingError("Location permission not granted");
+          return;
+        }
+
+        subscription = await Location.watchHeadingAsync(
+          (nextHeading) => {
+            if (!isActive) return;
+            setHeading(nextHeading);
+          },
+          (error) => {
+            if (!isActive) return;
+            setHeadingError(error?.message ?? "Heading error");
+          },
+        );
+      } catch (error) {
+        if (!isActive) return;
+        setHeadingError(error instanceof Error ? error.message : "Failed to read heading");
+      }
+    };
+
+    startHeading();
+
+    return () => {
+      isActive = false;
+      subscription?.remove();
+    };
+  }, [isDiagnosticsVisible]);
+
+  const trueHeadingAvailable =
+    typeof heading?.trueHeading === "number" && heading.trueHeading >= 0;
+  const absoluteHeading = trueHeadingAvailable ? heading?.trueHeading : heading?.magHeading;
+  const absoluteHeadingLabel =
+    typeof absoluteHeading === "number"
+      ? `${formatHeadingValue(absoluteHeading)} ${getCardinalDirection(absoluteHeading)}`
+      : "—";
+  const backendHeading = detectionData?.motion?.heading_deg;
+  const backendHeadingLabel =
+    typeof backendHeading === "number"
+      ? `${formatHeadingValue(backendHeading)} ${getCardinalDirection(backendHeading)}`
+      : "—";
 
   return (
     <SafeAreaView style={styles.screen}>
@@ -314,7 +404,7 @@ export const AudioStreamView = ({
 				<View style={styles.modalBackdrop}>
 					<View style={styles.modalSheet}>
 						<View style={styles.modalHeader}>
-							<Text style={styles.modalTitle}>Audio Diagnostics</Text>
+							<Text style={styles.modalTitle}>Diagnostics</Text>
 							<Button title="Close" onPress={onToggleDiagnostics} />
 						</View>
 						<ScrollView
@@ -386,6 +476,38 @@ export const AudioStreamView = ({
 								</Text>
 								<Text style={styles.helper}>
 									Deepgram error: {state.deepgramError ?? "None"}
+								</Text>
+							</View>
+
+							<View style={styles.card}>
+								<Text style={styles.cardTitle}>Compass</Text>
+								<Text style={styles.helper}>
+									Permission: {headingPermission}
+								</Text>
+								{headingError ? (
+									<Text style={styles.errorText}>Heading error: {headingError}</Text>
+								) : null}
+								<Text style={styles.helper}>
+									True heading:{" "}
+									{trueHeadingAvailable
+										? formatHeadingValue(heading?.trueHeading)
+										: "Unavailable"}
+								</Text>
+								<Text style={styles.helper}>
+									Mag heading: {formatHeadingValue(heading?.magHeading)}
+								</Text>
+								<Text style={styles.helper}>
+									Absolute: {absoluteHeadingLabel}
+								</Text>
+								<Text style={styles.helper}>
+									Calibration: {getHeadingAccuracyLabel(heading?.accuracy)}
+								</Text>
+							</View>
+
+							<View style={styles.card}>
+								<Text style={styles.cardTitle}>Heading (Backend)</Text>
+								<Text style={styles.helper}>
+									Heading: {backendHeadingLabel}
 								</Text>
 							</View>
 						</ScrollView>

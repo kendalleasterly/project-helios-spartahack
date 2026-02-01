@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { DeviceMotion } from "expo-sensors";
 import { Pedometer } from "expo-sensors";
+import * as Location from "expo-location";
 import { DeviceSensorPayload } from "./useWebSocket";
 
 // Constants for velocity calculation (from VelocityReadout.tsx)
@@ -41,6 +42,16 @@ const computeAverages = (
   };
 };
 
+const resolveHeadingDeg = (heading: Location.LocationHeadingObject) => {
+  if (typeof heading.trueHeading === "number" && heading.trueHeading >= 0) {
+    return heading.trueHeading;
+  }
+  if (typeof heading.magHeading === "number") {
+    return heading.magHeading;
+  }
+  return null;
+};
+
 interface UseDeviceSensorsConfig {
   enabled: boolean;
   onSensorUpdate: (payload: DeviceSensorPayload) => void;
@@ -58,6 +69,7 @@ export function useDeviceSensors({
   const samplesRef = useRef<
     Array<{ t: number; vx: number; vz: number; speed: number }>
   >([]);
+  const headingRef = useRef<number | null>(null);
   
   // State for pedometer
   const [stepsSinceOpen, setStepsSinceOpen] = useState(0);
@@ -86,6 +98,38 @@ export function useDeviceSensors({
     };
   }, [enabled]);
 
+  // Heading setup
+  useEffect(() => {
+    if (!enabled) return;
+
+    let subscription: Location.LocationSubscription | null = null;
+    let isMounted = true;
+
+    const startHeading = async () => {
+      try {
+        const permission = await Location.requestForegroundPermissionsAsync();
+        if (!isMounted) return;
+        if (permission.status !== "granted") {
+          headingRef.current = null;
+          return;
+        }
+
+        subscription = await Location.watchHeadingAsync((heading) => {
+          headingRef.current = resolveHeadingDeg(heading);
+        });
+      } catch (error) {
+        headingRef.current = null;
+      }
+    };
+
+    startHeading();
+
+    return () => {
+      isMounted = false;
+      subscription?.remove();
+    };
+  }, [enabled]);
+
   // Device Motion setup & Main Loop
   useEffect(() => {
     if (!enabled) return;
@@ -100,7 +144,7 @@ export function useDeviceSensors({
       // Fast sampling for integration (50ms)
       DeviceMotion.setUpdateInterval(50);
 
-      motionSubscription = DeviceMotion.addListener(({ acceleration, rotationRate, magneticField }) => {
+      motionSubscription = DeviceMotion.addListener(({ acceleration, rotationRate }) => {
         if (!acceleration) return;
 
         // --- Velocity Integration Logic ---
@@ -129,8 +173,9 @@ export function useDeviceSensors({
 
         // Zero velocity if device is still
         const aMag = Math.hypot(acceleration.x, acceleration.y, acceleration.z);
+        const rotationBeta = rotationRate?.beta ?? 0;
         const rMag = rotationRate
-          ? Math.hypot(rotationRate.alpha, rotationRate.beta, rotationRate.gamma)
+          ? Math.hypot(rotationRate.alpha ?? 0, rotationBeta, rotationRate.gamma ?? 0)
           : 0;
         
         if (aMag < STILL_ACCEL_THRESHOLD && rMag < STILL_ROTATION_THRESHOLD) {
@@ -171,8 +216,7 @@ export function useDeviceSensors({
               speed_avg_1s_mps: avg1s.speed,
               velocity_x_mps: vx,
               velocity_z_mps: vz,
-              magnetic_x_ut: magneticField?.x || 0,
-              magnetic_z_ut: magneticField?.z || 0,
+              heading_deg: headingRef.current,
               steps_last_3s: steps3s,
               steps_since_open: stepsSinceOpen, // We need to access state, might be stale in closure
             };

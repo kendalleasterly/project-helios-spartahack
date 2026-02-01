@@ -3,13 +3,14 @@ import { AudioStreamView } from "@/components/AudioStreamView";
 import { useAudioStreamViewModel } from "@/components/AudioStreamViewModel";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { useAudioGuidance } from "@/hooks/useAudioGuidance";
-import { useWakeWord } from "@/hooks/useWakeWord";
 import { usePersonCommands } from "@/hooks/usePersonCommands";
 import { useDeviceSensors } from "@/hooks/useDeviceSensors";
+import { useWakeWord } from "@/hooks/useWakeWord";
+import * as Haptics from "expo-haptics";
 
 export function MicStreamTest() {
   const { state, actions } = useAudioStreamViewModel();
-  const { socket, status: backendStatus, sendFrame, sendDeviceSensors, connect, onTextToken, detectionData } = useWebSocket();
+  const { socket, status: backendStatus, sendFrame, sendDeviceSensors, connect, onTextToken, onHaptic, detectionData } = useWebSocket();
   const [isDiagnosticsVisible, setIsDiagnosticsVisible] = useState(false);
   const [currentFrame, setCurrentFrame] = useState<string | null>(null);
   
@@ -41,7 +42,7 @@ export function MicStreamTest() {
   });
 
   // Process final transcripts for person commands
-  // Both hooks see all transcripts - patterns are mutually exclusive (both require "helios")
+  // Person commands still require "helios".
   useEffect(() => {
     if (state.finalTranscripts.length === 0) {
       lastProcessedTranscriptRef.current = null;
@@ -62,7 +63,8 @@ export function MicStreamTest() {
 
     // Process new transcripts
     for (let i = startIndex; i < state.finalTranscripts.length; i++) {
-      processPersonCommand(state.finalTranscripts[i]);
+      const transcript = state.finalTranscripts[i];
+      processPersonCommand(transcript);
     }
     
     // Remember the last transcript we processed
@@ -71,22 +73,55 @@ export function MicStreamTest() {
     }
   }, [state.finalTranscripts, processPersonCommand]);
 
+  const runBurst = useCallback(() => {
+    void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+    setTimeout(() => {
+      void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+    }, 120);
+    setTimeout(() => {
+      void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+    }, 240);
+  }, []);
+
+  // Initialize audio guidance (TTS)
+  const { isSpeaking, isReady, isInitializing, error: ttsError, stopSpeaking } = useAudioGuidance({
+    onTextToken,
+    enabled: true,
+  });
+
   // Wake word detection - monitors transcripts for "Helios" + general questions
-  // Patterns like "helios what is this" go here (not matched by person command patterns)
   const { consumePendingQuestion } = useWakeWord({
     partialTranscript: state.partialTranscript,
     finalTranscripts: state.finalTranscripts,
-  });
-
-  // Initialize audio guidance (TTS)
-  const { isSpeaking, isReady, isInitializing, error: ttsError } = useAudioGuidance({
-    onTextToken,
-    enabled: true,
+    onWakeWord: stopSpeaking,
   });
 
   useEffect(() => {
     connect();
   }, [connect]);
+
+  useEffect(() => {
+    onHaptic((event) => {
+      if (!event?.pattern || event.pattern === "burst") {
+        runBurst();
+        return;
+      }
+      if (event.pattern === "long-burst") {
+        runBurst();
+        setTimeout(() => runBurst(), 380);
+        return;
+      }
+      if (event.pattern === "heavy") {
+        void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
+      } else if (event.pattern === "warning") {
+        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Warning);
+      } else if (event.pattern === "error") {
+        void Haptics.notificationAsync(Haptics.NotificationFeedbackType.Error);
+      } else {
+        runBurst();
+      }
+    });
+  }, [onHaptic, runBurst]);
 
   // Log TTS status
   useEffect(() => {

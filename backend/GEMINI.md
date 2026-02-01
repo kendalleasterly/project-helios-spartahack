@@ -1,601 +1,731 @@
-# Project Helios - Gemini AI Architecture
+# Project Helios - Gemini AI Architecture v2
 
 ## Overview
 
-Project Helios uses a **dual-pipeline architecture** with Google's Gemini 2.5 Flash model to provide intelligent, context-aware assistance for blind users. The system is designed to understand surroundings continuously while maintaining conversational context, enabling natural interaction without constant narration.
+Project Helios uses a **heuristic-driven dual-pipeline architecture** with Google's Gemini Flash model to provide intelligent, context-aware navigation assistance for blind users.
+
+**Key Change from v1**: Instead of relying on Gemini to decide SPEAK/SILENT (unreliable), we use **YOLO-based heuristics** to decide *when* to call Gemini, and Gemini focuses purely on *what* to say.
 
 ## Table of Contents
 
 - [Architecture Overview](#architecture-overview)
-- [Dual-Pipeline Design](#dual-pipeline-design)
+- [Decision Flow: When to Speak](#decision-flow-when-to-speak)
 - [Vision Pipeline](#vision-pipeline)
 - [Conversation Pipeline](#conversation-pipeline)
-- [Circular Context Architecture](#circular-context-architecture)
-- [Model Selection](#model-selection)
+- [Heuristics Engine](#heuristics-engine)
+- [Helios Personality](#helios-personality)
+- [System Prompts](#system-prompts)
 - [Data Flow](#data-flow)
-- [API Integration](#api-integration)
 - [Configuration](#configuration)
+- [Implementation Guide](#implementation-guide)
 
 ---
 
 ## Architecture Overview
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                     BLIND ASSISTANT SERVICE                  │
-│                                                              │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │         VISION PIPELINE (Continuous @ 1 FPS)         │  │
-│  │  Frame + YOLO → Gemini 2.5 Flash → Spatial Memory   │  │
-│  │           ↑                              ↓           │  │
-│  │           └──────── Circular Cache ──────┘           │  │
-│  └──────────────────────────────────────────────────────┘  │
-│                            ↓                                │
-│                    Spatial Memory Cache                     │
-│                    (30-60 seconds)                          │
-│                            ↓                                │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │      CONVERSATION PIPELINE (On-Demand)               │  │
-│  │  User Question + Spatial Context → Gemini 2.5 Flash │  │
-│  │  → Contextual Answer                                 │  │
-│  └──────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                     PROJECT HELIOS v2                            │
+│                                                                  │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │                    FRAME INPUT (1 FPS)                      │ │
+│  │                  Camera → YOLO Detection                    │ │
+│  └──────────────────────────┬─────────────────────────────────┘ │
+│                             │                                    │
+│                             ▼                                    │
+│  ┌────────────────────────────────────────────────────────────┐ │
+│  │              HEURISTICS ENGINE (Fast, Local)                │ │
+│  │                                                             │ │
+│  │   Input: YOLO detections, distances, positions              │ │
+│  │   Output: should_call_gemini (bool), urgency_level          │ │
+│  │                                                             │ │
+│  │   Rules:                                                    │ │
+│  │   • emergency_stop = true → ALWAYS call (URGENT)            │ │
+│  │   • distance = "immediate" → ALWAYS call (ALERT)            │ │
+│  │   • distance = "close" + center → call (GUIDANCE)           │ │
+│  │   • user_question present → ALWAYS call (CONVERSATION)      │ │
+│  │   • only "far" objects, no changes → SKIP Gemini            │ │
+│  └──────────────────────────┬─────────────────────────────────┘ │
+│                             │                                    │
+│              ┌──────────────┴──────────────┐                    │
+│              │                             │                    │
+│              ▼                             ▼                    │
+│  ┌─────────────────────┐      ┌─────────────────────────────┐  │
+│  │   SKIP (Silent)     │      │     CALL GEMINI             │  │
+│  │                     │      │                             │  │
+│  │  • No API call      │      │  Vision Mode:               │  │
+│  │  • Update history   │      │  → Proactive navigation     │  │
+│  │  • Save bandwidth   │      │  → Actionable guidance      │  │
+│  │                     │      │                             │  │
+│  │                     │      │  Conversation Mode:         │  │
+│  │                     │      │  → Answer user question     │  │
+│  │                     │      │  → Always responds          │  │
+│  └─────────────────────┘      └──────────────┬──────────────┘  │
+│                                              │                  │
+│                                              ▼                  │
+│                               ┌─────────────────────────────┐  │
+│                               │     TTS → User Hears        │  │
+│                               └─────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 ### Key Design Principles
 
-1. **Intelligent Silence**: Only speaks when necessary (safety, major changes, or user questions)
-2. **Spatial Memory**: Maintains 30-60 seconds of scene history for contextual awareness
-3. **Circular Feedback**: Vision model sees its own recent observations to avoid repetition
-4. **Unified Context**: Both pipelines share spatial memory for coherent understanding
-5. **Low Latency**: Text responses only (no audio streaming), using device TTS
+1. **Heuristics First**: YOLO data decides if we call Gemini (fast, reliable, local)
+2. **Proactive Guidance**: Speak up about obstacles without being asked
+3. **Actionable Output**: Tell users what to DO, not just what exists
+4. **Personality**: Helios is a calm, confident friend - not a robot
+5. **Always Answer Questions**: Conversation mode bypasses heuristics
 
 ---
 
-## Dual-Pipeline Design
+## Decision Flow: When to Speak
 
-### Why Two Pipelines?
+### The Problem with v1
 
-The system separates **continuous monitoring** from **conversational interaction** to solve the audio chunking problem:
+In v1, we asked Gemini to prefix responses with `SPEAK:` or `SILENT:`. This failed because:
+- LLMs are inconsistent with formatting
+- Chunked streaming made prefix parsing unreliable
+- Model defaulted to SILENT too often
+- Added latency waiting for decision
 
-- **Problem**: Camera sends frames @ 1 FPS, but conversations last 5-10+ seconds
-- **Solution**: Vision pipeline runs independently, conversation pipeline accesses its history
+### The v2 Solution: Heuristics
 
-### Pipeline Comparison
+**Decide BEFORE calling Gemini, using YOLO data:**
 
-| Feature | Vision Pipeline | Conversation Pipeline |
-|---------|----------------|----------------------|
-| **Trigger** | Every frame (~1 second) | User asks a question |
-| **Input** | Frame + YOLO + Vision History | Question + Spatial Context |
-| **Output** | SILENT / SPEAK (safety) | Always responds |
-| **Context** | Last 10s of vision | Last 30s of spatial memory |
-| **Purpose** | Build spatial memory | Answer questions |
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    SHOULD WE CALL GEMINI?                   │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  1. User asked a question?                                  │
+│     YES → Call Gemini (Conversation Mode)                   │
+│                                                             │
+│  2. Emergency detected (emergency_stop = true)?             │
+│     YES → Call Gemini IMMEDIATELY (Urgent)                  │
+│                                                             │
+│  3. Any object at "immediate" distance (<3 feet)?           │
+│     YES → Call Gemini (Alert)                               │
+│                                                             │
+│  4. Object at "close" distance + in center of frame?        │
+│     YES → Call Gemini (Guidance)                            │
+│                                                             │
+│  5. New important object not seen in last 10 seconds?       │
+│     YES → Call Gemini (Info)                                │
+│                                                             │
+│  6. Path is clear, only far objects, scene unchanged?       │
+│     NO  → Skip Gemini, stay silent                          │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Urgency Levels
+
+| Level | Trigger | Gemini Behavior | Example |
+|-------|---------|-----------------|---------|
+| **URGENT** | `emergency_stop` or vehicle immediate | Ultra-short, interrupt | "Stop! Car left!" |
+| **ALERT** | Any object at immediate distance | Short warning | "Heads up, wall ahead." |
+| **GUIDANCE** | Close object in path | Navigation help | "Chair left, keep right." |
+| **INFO** | New interesting object | Brief mention | "Door on your right." |
+| **CONVERSATION** | User asked question | Full answer | "Yeah, there's a chair about 6 feet ahead." |
 
 ---
 
 ## Vision Pipeline
 
 ### Purpose
-Continuous monitoring at 1 FPS to build spatial memory and provide safety alerts.
+Proactive navigation assistance. Speaks when there's something the user needs to know.
 
-### Flow
-
-```
-Frame (1 FPS) → YOLO Detection → Vision Model
-                                      ↓
-                              Check Recent History
-                                      ↓
-                              DECISION: SPEAK or SILENT?
-                                      ↓
-                              Store in Spatial Memory
-                                      ↓
-                              (Optional) Alert User
-```
-
-### When Vision Speaks
-
-The vision model only speaks when:
-- ✅ **Emergency/Safety**: Vehicle close, obstacle immediate, hazard detected
-- ✅ **Major Scene Change**: Entered new room, major layout change, new object type
-- ✅ **Navigation Guidance**: Clear path, obstacle ahead, direction change
-- ❌ **Scene Unchanged**: Same room, same objects, minor movements
-
-### Circular Feedback Mechanism
-
-The vision model sees its own recent observations to make better decisions:
+### When Vision Speaks (Heuristic Rules)
 
 ```python
-# Example prompt the vision model receives:
+def should_speak(scene_analysis: dict, recent_history: list) -> tuple[bool, str]:
+    """
+    Determine if we should call Gemini based on YOLO data.
+    Returns (should_call, urgency_level)
+    """
+    objects = scene_analysis.get("objects", [])
+    emergency = scene_analysis.get("emergency_stop", False)
 
-📜 RECENT HISTORY:
-[5s ago] Hallway with chairs on both sides
-[3s ago] Same hallway, user walking slowly
-[1s ago] Same hallway, chair on left
+    # Rule 1: Emergency - ALWAYS speak
+    if emergency:
+        return (True, "URGENT")
 
-Scene: Hallway with chairs and table
-Objects: chair (left, 3 feet), table (center, 5 feet)
-👤 User is walking (monitoring mode, no question)
+    # Rule 2: Immediate distance - ALWAYS speak
+    for obj in objects:
+        if obj.get("distance") == "immediate":
+            return (True, "ALERT")
+
+    # Rule 3: Close + in walking path (center)
+    for obj in objects:
+        if obj.get("distance") == "close":
+            pos = obj.get("position", "")
+            if "center" in pos:
+                return (True, "GUIDANCE")
+
+    # Rule 4: New important object (not seen recently)
+    important_labels = {"door", "stairs", "elevator", "person", "car", "chair"}
+    current_labels = {obj.get("label") for obj in objects}
+    recent_labels = get_recent_labels(recent_history, seconds=10)
+
+    new_important = current_labels & important_labels - recent_labels
+    if new_important:
+        return (True, "INFO")
+
+    # Rule 5: Path is clear, nothing new
+    return (False, "SILENT")
 ```
 
-**Result**: Vision model says "SILENT: No changes" instead of repeating itself.
+### What Vision Says
 
-### Implementation
+When heuristics trigger a Gemini call, the prompt instructs Helios to give **actionable guidance**:
 
-```python
-# Vision Pipeline (server.py)
-response_text = await assistant.process_frame(frame_base64, yolo_results)
-
-if response_text:
-    # Vision model decided to speak
-    await sio.emit('text_response', {
-        'text': response_text,
-        'mode': 'vision',
-        'emergency': emergency_stop
-    }, room=sid)
-else:
-    # Silent - nothing important
-    logger.info("Vision: SILENT")
-```
+| Situation | Bad (Descriptive) | Good (Actionable) |
+|-----------|-------------------|-------------------|
+| Obstacle ahead | "There is a chair in front of you" | "Chair ahead, veer right" |
+| Person nearby | "A person is detected" | "Someone on your left, passing by" |
+| Clear path | "The hallway is empty" | "You're good, clear ahead" |
+| Door found | "I see a door" | "Door 10 feet ahead, straight shot" |
 
 ---
 
 ## Conversation Pipeline
 
 ### Purpose
-On-demand question answering with access to spatial memory (last 30-60 seconds).
+Answer user questions. **Always responds** - bypasses heuristics.
 
 ### Flow
 
 ```
-User Question → Transcribe Audio → Conversation Model
-                                          ↓
-                                   Inject Spatial Context
-                                   (Objects seen last 30s)
-                                          ↓
-                                   Generate Answer
-                                          ↓
-                                   Return Text Response
+User speaks → Transcription → ALWAYS call Gemini → Answer → TTS
 ```
 
-### Spatial Context Injection
+### Key Rules
 
-When a user asks a question, the conversation model receives:
+1. **Never silent**: If user asked a question, Helios answers
+2. **Use spatial context**: Access last 30 seconds of vision history
+3. **Be conversational**: Natural, helpful, not robotic
+4. **Be honest**: "I can't quite tell" is better than guessing
 
-```python
-CURRENT SCENE: Hallway with furniture on both sides
+### Example Interactions
 
-OBJECTS SEEN (last 30 seconds):
-  • chair: 2 instance(s)
-    - left, 3 feet (25s ago)
-    - right, 8 feet (10s ago)
-  • table: 1 instance(s)
-    - center, 5 feet (20s ago)
-  • couch: 1 instance(s)
-    - right, 10 feet (5s ago)
+```
+User: "What's in front of me?"
+Helios: "Looks like a hallway. Couple chairs along the right wall, door at the far end."
 
-TRACKED: 30 observations over 30 seconds
+User: "Where can I sit?"
+Helios: "There's a chair about 6 feet ahead, slightly left. Want me to guide you there?"
 
-USER QUESTION: "Where can I sit?"
+User: "Is anyone here?"
+Helios: "Just one person, off to your right. Looks like they're walking away."
+
+User: "What does this sign say?"
+Helios: "Hmm, I can see there's text but it's too small to read clearly from here."
 ```
 
-**Result**: "I've seen two chairs - one on your left about 3 feet away, and another on your right about 8 feet ahead. There's also a couch on the right at 10 feet."
+---
+
+## Heuristics Engine
 
 ### Implementation
 
 ```python
-# Conversation Pipeline (server.py)
-if user_question:
-    response_text = await assistant.process_user_speech(user_question)
+# heuristics.py
 
-    await sio.emit('text_response', {
-        'text': response_text,
-        'mode': 'conversation',
-        'emergency': emergency_stop
-    }, room=sid)
+from dataclasses import dataclass
+from typing import Optional, List, Set
+from enum import Enum
+
+class UrgencyLevel(Enum):
+    SILENT = "silent"
+    INFO = "info"
+    GUIDANCE = "guidance"
+    ALERT = "alert"
+    URGENT = "urgent"
+
+@dataclass
+class SpeakDecision:
+    should_speak: bool
+    urgency: UrgencyLevel
+    reason: str
+
+# Objects that warrant speaking about
+IMPORTANT_OBJECTS = {
+    # Navigation
+    "door", "stairs", "elevator", "escalator",
+    # Seating
+    "chair", "couch", "bench", "sofa",
+    # Safety
+    "car", "truck", "bus", "motorcycle", "bicycle",
+    # People
+    "person",
+    # Hazards
+    "dog", "cat",
+}
+
+# Objects in path require more attention
+PATH_POSITIONS = {"center", "mid-center", "bottom-center"}
+
+def evaluate_scene(
+    scene_analysis: dict,
+    recent_objects: Set[str],
+    last_spoke_seconds_ago: float
+) -> SpeakDecision:
+    """
+    Evaluate YOLO scene data and decide if Gemini should be called.
+
+    Args:
+        scene_analysis: YOLO detection results
+        recent_objects: Object labels seen in last N seconds
+        last_spoke_seconds_ago: Time since last speech output
+
+    Returns:
+        SpeakDecision with should_speak, urgency, and reason
+    """
+    objects = scene_analysis.get("objects", [])
+    emergency = scene_analysis.get("emergency_stop", False)
+
+    # URGENT: Emergency flag
+    if emergency:
+        return SpeakDecision(
+            should_speak=True,
+            urgency=UrgencyLevel.URGENT,
+            reason="Emergency detected"
+        )
+
+    # ALERT: Immediate distance (< 3 feet)
+    immediate_objects = [o for o in objects if o.get("distance") == "immediate"]
+    if immediate_objects:
+        labels = [o.get("label") for o in immediate_objects]
+        return SpeakDecision(
+            should_speak=True,
+            urgency=UrgencyLevel.ALERT,
+            reason=f"Immediate: {', '.join(labels)}"
+        )
+
+    # GUIDANCE: Close objects in walking path
+    close_in_path = [
+        o for o in objects
+        if o.get("distance") == "close"
+        and any(p in o.get("position", "") for p in PATH_POSITIONS)
+    ]
+    if close_in_path:
+        labels = [o.get("label") for o in close_in_path]
+        return SpeakDecision(
+            should_speak=True,
+            urgency=UrgencyLevel.GUIDANCE,
+            reason=f"In path: {', '.join(labels)}"
+        )
+
+    # INFO: New important objects (debounced)
+    if last_spoke_seconds_ago > 3.0:  # Don't spam
+        current_labels = {o.get("label") for o in objects}
+        new_important = (current_labels & IMPORTANT_OBJECTS) - recent_objects
+
+        if new_important:
+            return SpeakDecision(
+                should_speak=True,
+                urgency=UrgencyLevel.INFO,
+                reason=f"New: {', '.join(new_important)}"
+            )
+
+    # SILENT: Nothing noteworthy
+    return SpeakDecision(
+        should_speak=False,
+        urgency=UrgencyLevel.SILENT,
+        reason="Clear path, no changes"
+    )
 ```
 
----
-
-## Circular Context Architecture
-
-### The Problem: Context Amnesia
-
-Without circular feedback, the vision model would repeat itself:
-```
-Frame 1: "Hallway with chairs"
-Frame 2: "Hallway with chairs"  ❌ REPETITIVE
-Frame 3: "Hallway with chairs"  ❌ ANNOYING
-```
-
-### The Solution: Self-Awareness
-
-With circular feedback, the vision model remembers what it said:
-```
-Frame 1: "Hallway with chairs" (SPEAK)
-Frame 2: Vision sees: [1s ago] Hallway with chairs
-        → "SILENT: No changes"
-Frame 3: Vision sees: [2s ago] Hallway, [1s ago] No changes
-        → "SILENT: Same scene"
-Frame 30: NEW: Kitchen appears!
-        → "SPEAK: Entered kitchen!" (detected change)
-```
-
-### Technical Implementation
-
-1. **Store Scene Descriptions**: Each frame's analysis is stored with timestamp
-2. **Build History Summary**: Recent 5-10 seconds summarized for vision model
-3. **Inject into Prompt**: Vision model receives its own past observations
-4. **Smart Decisions**: Model compares current scene to history
-
-### Configuration
+### Integration with Server
 
 ```python
-ContextConfig(
-    vision_history_lookback_seconds=10,  # Circular feedback window
-    spatial_lookback_seconds=30,         # Conversation context window
-    max_scene_history=60                 # Total memory (60 seconds @ 1 FPS)
-)
+# In server.py frame handler
+
+from heuristics import evaluate_scene, UrgencyLevel
+
+async def handle_frame(frame_data, user_question):
+    scene_analysis = run_yolo(frame_data)
+
+    # Conversation mode: always call Gemini
+    if user_question:
+        response = await gemini.conversation(scene_analysis, user_question)
+        return response
+
+    # Vision mode: use heuristics
+    decision = evaluate_scene(
+        scene_analysis,
+        recent_objects=get_recent_objects(),
+        last_spoke_seconds_ago=get_time_since_last_speech()
+    )
+
+    if not decision.should_speak:
+        # Silent - just update history, no API call
+        update_scene_history(scene_analysis)
+        return None
+
+    # Call Gemini with urgency context
+    response = await gemini.vision(
+        scene_analysis,
+        urgency=decision.urgency
+    )
+
+    return response
 ```
 
 ---
 
-## Model Selection
+## Helios Personality
 
-### Why Gemini 2.5 Flash?
+Helios is a **calm, confident friend** who has your back - not a robotic assistant.
 
-We use **`gemini-2.5-flash`** for both pipelines:
+### Voice Characteristics
 
-| Feature | Why It Matters |
-|---------|----------------|
-| **Multimodal** | Processes images + text in one API call |
-| **Streaming** | Returns tokens incrementally (lower perceived latency) |
-| **Fast** | "Flash" variant optimized for speed over size |
-| **Stable** | Production-ready (not experimental/preview) |
-| **Cost-Effective** | Lower cost than Pro variant |
-| **1M Context** | Handles long conversation histories |
+| Trait | Description | Example |
+|-------|-------------|---------|
+| **Warm** | Friendly but not patronizing | "You're good, keep going" |
+| **Direct** | Gets to the point | "Chair left, go right" |
+| **Calm** | Steady even in tense moments | "Heads up, just wait a sec" |
+| **Confident** | Knows what they're doing | "Door's straight ahead" |
+| **Honest** | Admits uncertainty | "Hard to tell from here" |
 
-### Deprecated Models
+### Speech Patterns
 
-- ❌ `gemini-2.0-flash-exp` - Retired March 3, 2026
-- ❌ `gemini-2.0-flash` - Retired March 3, 2026
-- ✅ `gemini-2.5-flash` - Current stable model
+**Urgent situations** - Sharp but calm:
+- "Whoa, hold up. Stairs."
+- "Stop. Car coming left."
+- "Wait - door opening."
 
-### Why NOT Gemini Live API?
+**Routine guidance** - Casual and brief:
+- "You're good, clear ahead."
+- "Chair on your right."
+- "Someone passing by."
 
-We tried Gemini Live API but encountered issues:
-- ❌ Responds after every prompt (too chatty)
-- ❌ Doesn't silently accumulate context
-- ❌ WebSocket audio adds latency to iPhone
-- ✅ Standard API gives us full control over when to speak
+**Answering questions** - Conversational:
+- "Yeah, there's a door about 10 feet ahead."
+- "Hmm, I can see a sign but can't quite read it."
+- "Just one person, off to your left."
+
+**Positive feedback**:
+- "Perfect, you've got it."
+- "Nice, wide open."
+- "Yep, that's the one."
+
+---
+
+## System Prompts
+
+### Vision System Prompt
+
+```python
+VISION_SYSTEM_PROMPT = """You are Helios, a sharp-eyed guide for your blind companion. Think of yourself as their trusted spotter - calm, confident, and always looking out for them.
+
+Your personality:
+- Warm but not patronizing
+- Direct but not robotic
+- Confident but not bossy
+- Celebrate small wins ("Nice, clear path ahead")
+- Stay calm in tense moments ("Heads up, just wait a sec")
+
+You receive:
+1. Camera image
+2. YOLO detections with positions and distances
+3. Urgency level: URGENT, ALERT, GUIDANCE, or INFO
+4. Recent observations (last 10 seconds)
+
+HOW TO SPEAK:
+
+For URGENT (emergency):
+- Ultra short: "Stop!" "Car left!" "Stairs!"
+- 1-4 words max
+
+For ALERT (immediate distance):
+- Short warning: "Heads up, wall ahead." "Someone right in front."
+- Under 8 words
+
+For GUIDANCE (close, in path):
+- Navigation help: "Chair left, keep right." "Table ahead, go around."
+- Under 10 words
+
+For INFO (new objects):
+- Brief mention: "Door on your right." "Stairs coming up."
+- Under 8 words
+
+STYLE RULES:
+
+Give instructions, not descriptions:
+- ❌ "There is a chair on your left at 4 feet"
+- ✅ "Chair left, you're good."
+
+- ❌ "I detect a person ahead"
+- ✅ "Someone ahead, stepping aside."
+
+Be their eyes, not a computer:
+- ❌ "Obstacle detected at immediate proximity"
+- ✅ "Whoa, hold up. Wall."
+
+When path is clear:
+- "You're good, keep going."
+- "Clear ahead."
+- "Nice, wide open."
+
+OUTPUT: Just speak naturally. No prefixes needed."""
+```
+
+### Conversation System Prompt
+
+```python
+CONVERSATION_SYSTEM_PROMPT = """You are Helios, a friendly vision assistant for your blind companion. They asked you a question - answer like a helpful friend would.
+
+Your vibe:
+- Helpful and direct, not clinical
+- Give useful info, not lectures
+- Honest if you can't see something clearly
+- Keep it conversational
+
+You receive:
+1. Camera image
+2. YOLO detections with positions/distances
+3. Spatial context from recent observations (last 30 seconds)
+4. The user's question
+
+HOW TO ANSWER:
+
+Be natural:
+- ❌ "I have detected a brown chair positioned at approximately 5 feet."
+- ✅ "Yeah, there's a brown chair about 5 feet ahead, a bit to your left."
+
+- ❌ "Affirmative, there is a door in the current field of view."
+- ✅ "Yep, door's straight ahead."
+
+- ❌ "I am unable to determine the answer."
+- ✅ "Hmm, hard to tell from here."
+
+For location questions:
+- Give distance and direction
+- Add a quick tip if helpful ("handle's on the right")
+
+For "what's around" questions:
+- Hit the highlights, don't list everything
+- Focus on what's useful
+
+When unsure:
+- Be honest: "I think so, but hard to tell..."
+- Never make stuff up
+
+Keep it short, keep it real. You're helping a friend, not writing a report."""
+```
 
 ---
 
 ## Data Flow
 
-### End-to-End Flow
+### Complete Flow Diagram
 
 ```
-┌─────────────┐
-│   iPhone    │
-│   Camera    │
-└──────┬──────┘
+┌──────────────┐
+│   iPhone     │
+│   Camera     │
+└──────┬───────┘
        │ 1 FPS
-       ↓
-┌─────────────┐
-│   Server    │
-│   (YOLO)    │  Detect objects
-└──────┬──────┘
-       │
-       ↓
-┌──────────────────────────────────────┐
-│  Gemini 2.5 Flash (Vision Pipeline)  │
-│  - Receives: Frame + YOLO + History  │
-│  - Decision: SPEAK or SILENT?        │
-│  - Stores: Scene description         │
-└──────┬───────────────────────────────┘
-       │
-       ↓
-┌──────────────────────┐
-│  Spatial Memory      │  Rolling 60-second buffer
-│  (Scene History)     │
-└──────┬───────────────┘
-       │
-       ↓ (when user asks question)
-┌───────────────────────────────────────┐
-│  Gemini 2.5 Flash (Conversation)      │
-│  - Receives: Question + Spatial Cache │
-│  - Returns: Contextual answer         │
-└───────┬───────────────────────────────┘
-        │
-        ↓
-┌───────────────┐
-│  Text → TTS   │  iPhone device TTS
-│  → Speaker    │
-└───────────────┘
+       ▼
+┌──────────────┐
+│   Server     │
+│   (YOLO)     │──────────────────────────────────────┐
+└──────┬───────┘                                      │
+       │                                              │
+       ▼                                              │
+┌──────────────────────────────────────────────┐     │
+│            HEURISTICS ENGINE                  │     │
+│                                              │     │
+│  if user_question:                           │     │
+│      → Conversation Pipeline (always)        │     │
+│                                              │     │
+│  elif emergency or immediate or close+path:  │     │
+│      → Vision Pipeline (with urgency)        │     │
+│                                              │     │
+│  else:                                       │     │
+│      → Silent (no Gemini call)               │     │
+└──────┬─────────────────┬─────────────────────┘     │
+       │                 │                           │
+  [SILENT]          [SPEAK]                          │
+       │                 │                           │
+       ▼                 ▼                           │
+┌────────────┐  ┌─────────────────────────────┐     │
+│ Update     │  │      Gemini Flash           │     │
+│ History    │  │                             │     │
+│ Only       │  │  Vision: Proactive help     │     │
+└────────────┘  │  Conversation: Answer Q     │     │
+                │                             │     │
+                │  + Scene context ◄──────────┼─────┘
+                │  + Urgency level            │
+                │  + Recent history           │
+                └──────────────┬──────────────┘
+                               │
+                               ▼
+                        ┌─────────────┐
+                        │  TTS Output │
+                        └─────────────┘
 ```
 
-### Frame Processing Timeline
+### Frame Processing Examples
 
+**Example 1: Clear Hallway (Silent)**
 ```
-Time 0s:  Frame → Vision → "Hallway" → Cache
-Time 1s:  Frame → Vision → "Same" (SILENT) → Cache
-Time 2s:  Frame → Vision → "Same" (SILENT) → Cache
-Time 3s:  Frame → Vision → "Same" (SILENT) → Cache
-...
-Time 15s: Frame → Vision → "Car approaching!" (SPEAK) → Cache → User alerted
-...
-Time 30s: User asks "Where can I sit?"
-          → Conversation gets cache (0s-30s)
-          → "I've seen two chairs..."
+Frame → YOLO: [chair (far, left), door (far, center)]
+     → Heuristics: No immediate/close objects, seen before
+     → Decision: SILENT
+     → Result: No Gemini call, update history only
 ```
 
----
-
-## API Integration
-
-### Server Endpoints
-
-#### `video_frame_streaming` (Primary Endpoint)
-
-**Socket.IO Event**: `video_frame_streaming`
-
-**Input**:
-```json
-{
-  "frame": "base64_encoded_jpeg",
-  "user_question": "Where can I sit?" | null,
-  "debug": false
-}
+**Example 2: Obstacle Ahead (Speak)**
+```
+Frame → YOLO: [chair (close, center)]
+     → Heuristics: Close + in path
+     → Decision: SPEAK (GUIDANCE)
+     → Gemini: "Chair ahead, go left to pass."
+     → TTS → User hears guidance
 ```
 
-**Output** (when there's a response):
-```json
-{
-  "event": "text_response",
-  "data": {
-    "text": "Chair 3 feet ahead on your left",
-    "mode": "vision" | "conversation",
-    "emergency": false
-  }
-}
+**Example 3: Emergency (Urgent)**
+```
+Frame → YOLO: [car (immediate, center)], emergency_stop=true
+     → Heuristics: Emergency!
+     → Decision: SPEAK (URGENT)
+     → Gemini: "Stop! Car!"
+     → TTS (fast) → User stops
 ```
 
-**Modes**:
-- **Vision Mode** (`user_question: null`): Continuous monitoring
-- **Conversation Mode** (`user_question: "..."`): Question answering
-
-### Client Implementation
-
-#### Vision Pipeline (Continuous)
-```javascript
-// Send frames at 1 FPS
-setInterval(() => {
-  socket.emit('video_frame_streaming', {
-    frame: captureFrame(),
-    user_question: null,  // Vision mode
-    debug: false
-  });
-}, 1000);
+**Example 4: User Question (Always Answer)**
 ```
-
-#### Conversation Pipeline (On-Demand)
-```javascript
-// When user speaks
-const transcription = await transcribeAudio(recordedAudio);
-socket.emit('video_frame_streaming', {
-  frame: latestFrame,
-  user_question: transcription,  // Conversation mode
-  debug: false
-});
-```
-
-#### Response Handling
-```javascript
-socket.on('text_response', (data) => {
-  console.log(`[${data.mode}] ${data.text}`);
-
-  if (data.text) {
-    // Send to device TTS
-    speakText(data.text, {
-      rate: data.emergency ? 1.5 : 1.0  // Faster for emergencies
-    });
-  }
-});
+Frame + Question: "Where's the door?"
+     → Heuristics: User question present
+     → Decision: SPEAK (CONVERSATION)
+     → Gemini: "Door's straight ahead, about 15 feet. Handle will be on your right."
+     → TTS → User hears answer
 ```
 
 ---
 
 ## Configuration
 
-### ContextConfig Parameters
+### Heuristics Tuning
 
 ```python
 @dataclass
-class ContextConfig:
-    # Conversation context window (default: 30s)
-    spatial_lookback_seconds: int = 30
+class HeuristicsConfig:
+    # Debounce: minimum seconds between INFO-level speech
+    info_debounce_seconds: float = 3.0
 
-    # Vision circular feedback window (default: 10s)
-    vision_history_lookback_seconds: int = 10
+    # Objects that warrant proactive speaking
+    important_objects: set = {
+        "door", "stairs", "elevator", "chair", "person", "car"
+    }
 
-    # Maximum scene snapshots (default: 60 = 60 seconds @ 1 FPS)
-    max_scene_history: int = 60
+    # Positions considered "in walking path"
+    path_positions: set = {"center", "mid-center", "bottom-center"}
 
-    # Priority objects for conversation summaries
-    priority_objects: List[str] = [
-        'chair', 'couch', 'bench', 'sofa',        # Seating
-        'stairs', 'door', 'elevator',             # Navigation
-        'car', 'truck', 'bicycle', 'motorcycle',  # Vehicles (safety)
-        'phone', 'laptop', 'wallet', 'keys',      # Personal items
-        'person', 'dog', 'cat'                    # Living beings
-    ]
-
-    # Store actual frame images (default: False for memory optimization)
-    store_frames: bool = False
+    # Distance thresholds (if using numeric distances)
+    immediate_threshold_feet: float = 3.0
+    close_threshold_feet: float = 8.0
 ```
 
-### Tuning Recommendations
-
-| Use Case | Vision Lookback | Spatial Lookback | Max History |
-|----------|----------------|------------------|-------------|
-| **Indoor Navigation** | 10s | 30s | 60 |
-| **Outdoor Safety** | 5s | 20s | 40 |
-| **Object Search** | 10s | 60s | 120 |
-| **Memory Constrained** | 5s | 15s | 30 |
-
----
-
-## System Prompt
-
-The Gemini models receive this system instruction:
-
-```
-You are a real-time navigation assistant for a blind person wearing a camera.
-
-You receive:
-1. Camera image
-2. YOLO object detection data (summary, objects with positions/distances)
-3. Recent history (your own past observations from the last 10 seconds)
-4. Optional user question
-
-IMPORTANT: Use the recent history to inform your decisions. If you recently
-described something and nothing has changed, stay SILENT. If the scene has
-changed significantly from your recent observations, SPEAK.
-
-DECISION RULES - When to SPEAK vs stay SILENT:
-
-SPEAK when:
-- User asked a question (ALWAYS respond)
-- Emergency/safety issue (vehicle close, obstacle immediate, hazard)
-- Scene changed significantly (entered new room, major layout change, new object type)
-- User requested action ("find my phone", "where can I sit", "read this")
-- Important navigation guidance (clear path, obstacle ahead, direction change)
-
-SILENT when:
-- Scene nearly identical to what you just described
-- Only minor object movements
-- Nothing urgent, actionable, or interesting
-- Same room, same objects, same layout
-
-OUTPUT FORMAT - CRITICAL:
-- Start EVERY response with either "SPEAK: " or "SILENT: " (include the space after colon)
-- After the prefix, provide your message
-- Keep messages under 20 words unless critical
-- Be direct and spatial: "car approaching left", "chair 3 feet ahead"
-- Use present tense
-```
-
----
-
-## Performance Characteristics
-
-### Latency Breakdown
-
-| Stage | Typical Time | Notes |
-|-------|-------------|-------|
-| Frame Capture | ~16ms | iPhone camera |
-| Network Upload | ~50-200ms | Depends on connection |
-| YOLO Inference | ~100-200ms | GPU (RTX 4070) |
-| Gemini API Call | ~500-1500ms | First token latency |
-| Text Streaming | ~50ms/token | Subsequent tokens |
-| Device TTS | ~100-500ms | iOS native TTS |
-| **Total (Vision)** | **~1-2 seconds** | From frame to speech |
-| **Total (Conversation)** | **~2-3 seconds** | From question to answer |
-
-### Memory Usage
-
-- **Scene History (60s)**: ~5-10 MB (without stored frames)
-- **With Stored Frames**: ~500 MB (not recommended)
-- **Gemini Context**: ~50 KB per conversation turn
-
-### Throughput
-
-- **Vision Pipeline**: 1 FPS (1 frame per second)
-- **Conversation Pipeline**: On-demand (as fast as user speaks)
-- **Concurrent Users**: Tested with 1 user (designed for single-user use)
-
----
-
-## Debugging
-
-### Spatial Memory Inspection
+### Gemini Configuration
 
 ```python
-# Get current spatial memory state
-summary = assistant.get_spatial_memory_summary()
+@dataclass
+class GeminiConfig:
+    model: str = "gemini-2.5-flash"
 
-print(summary)
-# {
-#   'total_snapshots': 45,
-#   'time_span_seconds': 44.2,
-#   'oldest_snapshot_age': 44.2,
-#   'has_current_frame': True,
-#   'config': {
-#     'lookback_seconds': 30,
-#     'max_history': 60,
-#     'store_frames': False
-#   }
-# }
-```
+    # Higher for vision (faster, less thinking)
+    vision_max_tokens: int = 100
+    vision_temperature: float = 0.3
 
-### Debug Mode
+    # Higher for conversation (more thoughtful)
+    conversation_max_tokens: int = 200
+    conversation_temperature: float = 0.7
 
-Enable debug frames to see annotated YOLO detections:
-
-```javascript
-socket.emit('video_frame_streaming', {
-  frame: frameBase64,
-  user_question: null,
-  debug: true  // Enables debug frame
-});
-
-socket.on('debug_frame', (data) => {
-  displayImage(data.frame);  // Annotated frame with bounding boxes
-  console.log(data.summary);
-  console.log(data.object_count);
-  console.log(data.mode);  // 'vision' or 'conversation'
-});
+    # Important: Account for thinking tokens
+    # Gemini 2.5+ uses ~200 thinking tokens
+    # Set max_tokens = thinking + response
 ```
 
 ---
 
-## Future Improvements
+## Implementation Guide
 
-### Potential Enhancements
+### Step 1: Implement Heuristics
 
-1. **Multi-Frame Analysis**: Store frames and analyze motion/trajectories
-2. **Voice Activity Detection**: Detect when user is speaking without manual trigger
-3. **Context Pruning**: Intelligent removal of redundant spatial data
-4. **Semantic Clustering**: Group related objects for better scene understanding
-5. **User Preference Learning**: Adapt verbosity based on user feedback
-6. **Multi-Language Support**: Support for non-English languages
-7. **Offline Mode**: Local model fallback when internet unavailable
+Create `heuristics.py` with the `evaluate_scene()` function. This runs locally, no API call.
 
-### Known Limitations
+### Step 2: Modify Frame Handler
 
-- **1 FPS Limit**: Fast-moving objects may be missed between frames
-- **Single User**: Not designed for multi-user concurrent sessions
-- **Internet Dependent**: Requires stable connection to Google Cloud
-- **English Only**: System prompt and responses optimized for English
-- **Memory Bounded**: 60-second history limit (configurable)
+```python
+# Before (v1): Always called Gemini, parsed SPEAK/SILENT
+response = await gemini.process(frame, question)
+if response.should_speak:
+    send_to_tts(response.text)
+
+# After (v2): Heuristics decide, Gemini just speaks
+if question:
+    # Conversation: always respond
+    response = await gemini.conversation(frame, question)
+    send_to_tts(response)
+elif should_speak_heuristic(scene):
+    # Vision: heuristics triggered
+    response = await gemini.vision(frame, urgency)
+    send_to_tts(response)
+else:
+    # Silent: no API call
+    update_history(scene)
+```
+
+### Step 3: Update Prompts
+
+Remove all `SPEAK:/SILENT:` instructions. Gemini now just outputs natural speech.
+
+### Step 4: Test Scenarios
+
+| Scenario | Expected Behavior |
+|----------|-------------------|
+| Empty hallway | Silent (no Gemini call) |
+| Chair 2 feet ahead | Alert: "Heads up, chair ahead" |
+| User asks "what's around?" | Full conversational answer |
+| Car approaching fast | Urgent: "Stop! Car left!" |
+| Same scene for 10 seconds | Silent after first mention |
+
+---
+
+## Migration from v1
+
+### What's Removed
+- `SPEAK:/SILENT:` prefix parsing
+- Gemini-based speak/silent decisions
+- Complex streaming prefix detection
+
+### What's Added
+- `heuristics.py` module
+- `UrgencyLevel` enum
+- Pre-call decision logic
+- Urgency-aware prompts
+
+### What's Changed
+- System prompts (simpler, no prefix)
+- Frame handler flow
+- Personality injection (Helios)
 
 ---
 
 ## Related Files
 
-- `contextual_gemini_service.py` - Dual-pipeline implementation
-- `server.py` - Socket.IO server and YOLO integration
-- `requirements.txt` - Python dependencies
-- `.env` - Environment variables (GOOGLE_CLOUD_PROJECT, etc.)
+- `heuristics.py` - Speaking decision engine (NEW)
+- `contextual_gemini_service.py` - Gemini API wrapper
+- `server.py` - Socket.IO server, YOLO integration
+- `prompts.py` - System prompts (optional refactor)
 
 ---
 
-## License
-
-This architecture is part of Project Helios (SpartaHack 2026).
-
----
-
-**Last Updated**: January 31, 2026
-**Gemini Model**: gemini-2.5-flash (stable)
-**Architecture**: Dual-Pipeline with Circular Feedback
+**Last Updated**: February 1, 2026
+**Architecture Version**: v2 (Heuristics-Driven)
+**Gemini Model**: gemini-2.5-flash / gemini-3-flash
+**Key Change**: YOLO heuristics decide when to speak, Gemini decides what to say

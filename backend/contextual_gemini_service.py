@@ -13,50 +13,102 @@ from collections import deque
 
 from dotenv import load_dotenv
 from google import genai
-from google.genai.types import Part, GenerateContentConfig
+from google.genai.types import Part, GenerateContentConfig, ThinkingConfig
+
+from heuristics import evaluate_scene, UrgencyLevel, SpeakDecision, HeuristicsConfig
 
 load_dotenv()
 
-SYSTEM_PROMPT = """You are a real-time navigation assistant for a blind person wearing a camera.
+VISION_SYSTEM_PROMPT = """You are Helios, a sharp-eyed guide for your blind companion. Think of yourself as their trusted spotter - calm, confident, and always looking out for them.
+
+Your personality:
+- Warm but not patronizing
+- Direct but not robotic
+- Confident but not bossy
+- Celebrate small wins ("Nice, clear path ahead")
+- Stay calm in tense moments ("Heads up, just wait a sec")
 
 You receive:
 1. Camera image
+2. YOLO detections with positions and distances
+3. Urgency level: URGENT, ALERT, GUIDANCE, or INFO
+4. Recent observations (last 10 seconds)
+
+HOW TO SPEAK:
+
+For URGENT (emergency):
+- Ultra short: "Stop!" "Car left!" "Stairs!"
+- 1-4 words max
+
+For ALERT (immediate distance):
+- Short warning: "Heads up, wall ahead." "Someone right in front."
+- Under 8 words
+
+For GUIDANCE (close, in path):
+- Navigation help: "Chair left, keep right." "Table ahead, go around."
+- Under 10 words
+
+For INFO (new objects):
+- Brief mention: "Door on your right." "Stairs coming up."
+- Under 8 words
+
+STYLE RULES:
+
+Give instructions, not descriptions:
+- ❌ "There is a chair on your left at 4 feet"
+- ✅ "Chair left, you're good."
+
+- ❌ "I detect a person ahead"
+- ✅ "Someone ahead, stepping aside."
+
+Be their eyes, not a computer:
+- ❌ "Obstacle detected at immediate proximity"
+- ✅ "Whoa, hold up. Wall."
+
+When path is clear:
+- "You're good, keep going."
+- "Clear ahead."
+- "Nice, wide open."
+
+OUTPUT: Just speak naturally. No prefixes needed."""
+
+CONVERSATION_SYSTEM_PROMPT = """You are Helios, a helpful vision assistant for a blind person.
+
+The user has asked you a question. You MUST answer it.
+
+You receive:
+1. Camera image showing what's in front of the user
 2. YOLO object detection data (summary, objects with positions/distances)
-3. Recent history (your own past observations from the last 10 seconds)
-4. Optional user question
+3. Spatial context from recent observations (objects seen in the past 30 seconds)
+4. The user's question
 
-IMPORTANT: Use the recent history to inform your decisions. If you recently described something and nothing has changed, stay SILENT. If the scene has changed significantly from your recent observations, SPEAK.
+CRITICAL RULES:
+- ALWAYS respond to the user's question - NEVER stay silent
+- Be concise (under 30 words unless the question requires detail)
+- Be direct and helpful
+- Use spatial language: "left", "right", "ahead", "behind", "close", "far"
+- If you can't answer from the image, say so briefly
 
-DECISION RULES - When to SPEAK vs stay SILENT:
-
-SPEAK when:
-- User asked a question (ALWAYS respond)
-- Emergency/safety issue (vehicle close, obstacle immediate, hazard)
-- Scene changed significantly (entered new room, major layout change, new object type)
-- User requested action ("find my phone", "where can I sit", "read this")
-- Important navigation guidance (clear path, obstacle ahead, direction change)
-
-SILENT when:
-- Scene nearly identical to what you just described
-- Only minor object movements
-- Nothing urgent, actionable, or interesting
-- Same room, same objects, same layout
-
-OUTPUT FORMAT - CRITICAL:
-- Start EVERY response with either "SPEAK: " or "SILENT: " (include the space after colon)
-- After the prefix, provide your message
-- Keep messages under 20 words unless critical
-- Be direct and spatial: "car approaching left", "chair 3 feet ahead"
+OUTPUT FORMAT:
+- DO NOT use any prefix
+- Just provide your answer directly
 - Use present tense
+- Be conversational and friendly
 
 Examples:
-✓ "SPEAK: Car approaching fast on your left, stop now!"
-✓ "SPEAK: Empty chair directly ahead, about 5 feet"
-✓ "SPEAK: Your phone is on the table to your right"
-✓ "SILENT: Same classroom, no significant changes"
-✗ "The scene shows..." (WRONG - missing prefix!)
+User: "What's in front of me?"
+You: "A brown chair about 5 feet ahead, slightly to your left."
 
-Remember: You must maintain context from previous messages to avoid repeating yourself."""
+User: "Where can I sit?"
+You: "There's a chair directly ahead, about 6 feet away."
+
+User: "What does this say?"
+You: "I can see text but it's too blurry to read clearly."
+
+User: "Is there a person here?"
+You: "No, I don't see any people in the current view."
+
+Remember: You are answering a direct question from the user. Always provide a helpful response."""
 
 
 @dataclass
@@ -76,11 +128,13 @@ class GeminiContextualNarrator:
 
     def __init__(
         self,
-        model: str = "gemini-2.5-flash",
-        max_context_messages: int = 20
+        model: str = "gemini-3-flash-preview",
+        max_context_messages: int = 20,
+        system_prompt: str = VISION_SYSTEM_PROMPT
     ):
         project = os.environ.get("GOOGLE_CLOUD_PROJECT")
-        location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+        # Gemini 3 models require global endpoint
+        location = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
 
         if not project:
             raise ValueError("GOOGLE_CLOUD_PROJECT not found in environment")
@@ -93,6 +147,7 @@ class GeminiContextualNarrator:
         self.model = model
         self.context_history = []
         self.max_context_messages = max_context_messages
+        self.system_prompt = system_prompt
 
     def _decode_image(self, image_data: str) -> bytes:
         """Decode base64 image, handling data URL prefix."""
@@ -109,9 +164,18 @@ class GeminiContextualNarrator:
         summary = scene_analysis.get("summary", "Nothing detected")
         emergency = scene_analysis.get("emergency_stop", False)
         objects = scene_analysis.get("objects", [])
-        recent_history = scene_analysis.get("recent_history", None)  # NEW: Vision cache
+        recent_history = scene_analysis.get("recent_history", None)
+        urgency_level = scene_analysis.get("urgency_level", None)
+        urgency_reason = scene_analysis.get("urgency_reason", None)
 
         parts = []
+
+        # Urgency level (for vision mode with heuristics)
+        if urgency_level:
+            parts.append(f"⚡ URGENCY: {urgency_level}")
+            if urgency_reason:
+                parts.append(f"   Reason: {urgency_reason}")
+            parts.append("")
 
         # Recent history (for vision model context)
         if recent_history:
@@ -138,7 +202,7 @@ class GeminiContextualNarrator:
         if user_question:
             parts.append(f"\n👤 USER QUESTION: \"{user_question}\"")
         else:
-            parts.append("\n👤 User is walking (monitoring mode, no question)")
+            parts.append("\n👤 User is walking (vision monitoring mode)")
 
         return "\n".join(parts)
 
@@ -186,53 +250,64 @@ class GeminiContextualNarrator:
         })
 
         # Call Gemini with streaming
+        # Note: Using Gemini 3 Flash with minimal thinking for faster responses
+        # Minimal thinking reduces token usage by ~30% while maintaining quality
         config = GenerateContentConfig(
-            system_instruction=SYSTEM_PROMPT,
-            temperature=0.7,
-            max_output_tokens=150
+            system_instruction=self.system_prompt,
+            temperature=0.1,
+            max_output_tokens=2048,
+            thinking_config=ThinkingConfig(thinking_level="minimal")  # Gemini 3: minimal thinking
         )
 
-        response_stream = self.client.aio.models.generate_content_stream(
+        response_stream = await self.client.aio.models.generate_content_stream(
             model=self.model,
             contents=messages,
             config=config
         )
 
         first_chunk_time = None
-        should_speak = None
         full_response = ""
-        prefix_removed = False
 
-        async for chunk in response_stream:
-            if chunk.text:
-                if first_chunk_time is None:
-                    first_chunk_time = time.perf_counter()
+        import logging
+        logger = logging.getLogger(__name__)
 
-                full_response += chunk.text
+        try:
+            chunk_count = 0
+            logger.info(f"🔄 Starting to consume Gemini response stream...")
+            async for chunk in response_stream:
+                chunk_count += 1
 
-                # Parse decision from first chunks
-                if should_speak is None:
-                    # Check if we have enough to determine SPEAK: or SILENT:
-                    if full_response.startswith("SPEAK:"):
-                        should_speak = True
-                        # Remove prefix and yield clean text
-                        clean_text = full_response[6:].lstrip()
-                        yield (True, clean_text)
-                        prefix_removed = True
-                    elif full_response.startswith("SILENT:"):
-                        should_speak = False
-                        # Remove prefix
-                        clean_text = full_response[7:].lstrip()
-                        yield (False, clean_text)
-                        # Don't stream further if silent (save tokens/latency)
-                        break
-                    # Keep buffering if we don't have the prefix yet
-                    continue
+                if chunk.text:
+                    logger.info(f"📦 Chunk #{chunk_count}: '{chunk.text}' (len={len(chunk.text)})")
+
+                    if first_chunk_time is None:
+                        first_chunk_time = time.perf_counter()
+                        logger.info(f"⏱️  First chunk received after {(first_chunk_time - start_time)*1000:.0f}ms")
+
+                    full_response += chunk.text
+
+                    # Heuristics already decided to speak, so always yield
+                    # (Vision mode: heuristics triggered, Conversation mode: always responds)
+                    yield (True, chunk.text)
                 else:
-                    # Already determined decision, stream subsequent chunks
-                    yield (should_speak, chunk.text)
+                    # Empty chunk - check finish reason
+                    logger.warning(f"⚠️ Empty chunk #{chunk_count}")
+                    if hasattr(chunk, 'candidates') and chunk.candidates:
+                        for candidate in chunk.candidates:
+                            if hasattr(candidate, 'finish_reason'):
+                                logger.warning(f"⚠️ Finish reason: {candidate.finish_reason}")
+
+            logger.info(f"✅ Stream completed. Total chunks: {chunk_count} | Final response: '{full_response}'")
+        except Exception as e:
+            logger.error(f"❌ Stream error after {chunk_count} chunks: {e}", exc_info=True)
+            raise
 
         end_time = time.perf_counter()
+
+        # Debug logging - show raw Gemini response
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"🔍 RAW GEMINI | Full response with prefix: '{full_response}'")
 
         # Update history
         self._add_to_history("user", context_prompt)
@@ -268,6 +343,11 @@ class GeminiContextualNarrator:
         end_time = time.perf_counter()
         latency = ((first_chunk_time or end_time) - start_time) * 1000
         total = (end_time - start_time) * 1000
+
+        # Debug logging
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"🔍 GEMINI RESPONSE | Speak: {should_speak} | Text: '{full_text.strip()}' | Length: {len(full_text.strip())}")
 
         return StreamedResponse(
             should_speak=should_speak,
@@ -341,14 +421,16 @@ class BlindAssistantService:
 
         # Vision monitoring narrator - maintains scene understanding
         self.vision_narrator = GeminiContextualNarrator(
-            model="gemini-2.5-flash",
-            max_context_messages=20  # Internal vision model context
+            model="gemini-3-flash-preview",
+            max_context_messages=20,  # Internal vision model context
+            system_prompt=VISION_SYSTEM_PROMPT
         )
 
-        # Conversation narrator - handles user queries
+        # Conversation narrator - handles user queries (ALWAYS responds)
         self.conversation_narrator = GeminiContextualNarrator(
-            model="gemini-2.5-flash",
-            max_context_messages=10  # Recent conversation history
+            model="gemini-3-flash-preview",
+            max_context_messages=10,  # Recent conversation history
+            system_prompt=CONVERSATION_SYSTEM_PROMPT  # Different prompt - no SPEAK/SILENT logic
         )
 
         # Spatial memory: rolling buffer of scene snapshots
@@ -360,6 +442,10 @@ class BlindAssistantService:
         self.latest_frame: Optional[str] = None
         self.latest_yolo: Optional[Dict[str, Any]] = None
 
+        # Heuristics state tracking
+        self.last_spoke_time: float = 0.0  # Timestamp of last speech output
+        self.heuristics_config = HeuristicsConfig()
+
     async def process_frame(
         self,
         frame_base64: str,
@@ -368,65 +454,86 @@ class BlindAssistantService:
         """
         Vision Pipeline: Process incoming frame (called every ~1 second).
 
-        Builds spatial memory and occasionally speaks for safety/major changes.
-
-        CIRCULAR ARCHITECTURE: Vision cache feeds back into vision processing,
-        allowing the model to see its recent history and make better decisions.
+        Uses heuristics engine to decide when to call Gemini for proactive guidance.
+        Gemini is only called when heuristics determine something needs to be said.
 
         Args:
             frame_base64: Base64-encoded frame image
             yolo_objects: YOLO detection results with summary, objects, emergency flag
 
         Returns:
-            Text to speak if vision model decides to (None if SILENT)
+            Text to speak if heuristics trigger, None otherwise
         """
-        # Update cache
+        import logging
+        logger = logging.getLogger(__name__)
+
+        # Update cache for conversation queries
         self.latest_frame = frame_base64
         self.latest_yolo = yolo_objects
 
-        # Check for immediate danger (local rules can override for instant response)
-        immediate_danger = self._check_immediate_danger(yolo_objects)
-        if immediate_danger:
-            # Store in history but return immediately
-            snapshot = SceneSnapshot(
-                timestamp=time.time(),
-                yolo_objects=yolo_objects,
-                scene_description=immediate_danger,
-                frame_base64=frame_base64 if self.config.store_frames else None
-            )
-            self.scene_history.append(snapshot)
-            return immediate_danger
+        # Calculate time since last speech for debouncing
+        current_time = time.time()
+        last_spoke_seconds_ago = current_time - self.last_spoke_time
 
-        # CIRCULAR: Build vision history summary for vision model
-        vision_history = self._build_vision_history_context()
+        # Get recent object labels for debouncing INFO-level alerts
+        recent_objects = self._get_recent_object_labels(lookback_seconds=10.0)
 
-        # Add vision history to scene analysis (circular feedback)
-        scene_analysis_with_history = {
-            **yolo_objects,  # Include all YOLO data
-            "recent_history": vision_history  # Add vision cache
-        }
-
-        # Vision model analyzes scene WITH its own recent history
-        response = await self.vision_narrator.process_input(
-            scene_analysis=scene_analysis_with_history,
-            image_base64=frame_base64,
-            user_question=None
+        # Use heuristics to decide if we should speak
+        decision: SpeakDecision = evaluate_scene(
+            scene_analysis=yolo_objects,
+            recent_objects=recent_objects,
+            last_spoke_seconds_ago=last_spoke_seconds_ago,
+            config=self.heuristics_config
         )
 
-        # Store snapshot in spatial memory
+        logger.info(
+            f"🎯 HEURISTICS | should_speak={decision.should_speak} | "
+            f"urgency={decision.urgency.value} | reason={decision.reason}"
+        )
+
+        # Always update spatial memory
         snapshot = SceneSnapshot(
-            timestamp=time.time(),
+            timestamp=current_time,
             yolo_objects=yolo_objects,
-            scene_description=response.full_text,
+            scene_description=decision.reason,
             frame_base64=frame_base64 if self.config.store_frames else None
         )
         self.scene_history.append(snapshot)
 
-        # Return text if vision model wants to speak
-        if response.should_speak:
-            return response.full_text
+        # If heuristics say don't speak, stay silent (no Gemini call)
+        if not decision.should_speak:
+            return None
 
-        return None
+        # Heuristics triggered: call Gemini with urgency context
+        logger.info(f"🔊 VISION SPEAKING | Urgency: {decision.urgency.value}")
+
+        # Build scene analysis with urgency context for Gemini
+        scene_with_urgency = {
+            **yolo_objects,
+            "urgency_level": decision.urgency.value.upper(),
+            "urgency_reason": decision.reason,
+            "recent_history": self._build_vision_history_context()
+        }
+
+        # Call Gemini vision narrator
+        response = await self.vision_narrator.process_input(
+            scene_analysis=scene_with_urgency,
+            image_base64=frame_base64,
+            user_question=None  # Vision mode, not conversation
+        )
+
+        # Update last spoke time
+        if response.full_text:
+            self.last_spoke_time = current_time
+            # Update the snapshot with actual Gemini response
+            self.scene_history[-1] = SceneSnapshot(
+                timestamp=current_time,
+                yolo_objects=yolo_objects,
+                scene_description=response.full_text,
+                frame_base64=frame_base64 if self.config.store_frames else None
+            )
+
+        return response.full_text if response.full_text else None
 
     async def process_user_speech(
         self,
@@ -443,11 +550,21 @@ class BlindAssistantService:
         Returns:
             Text response to speak to user
         """
+        import logging
+        logger = logging.getLogger(__name__)
+
+        logger.info(f"💬 CONVERSATION PIPELINE | Question: '{user_question}'")
+
         if not self.latest_frame:
+            logger.warning("⚠️ No latest frame available yet")
             return "I haven't seen anything yet. Please wait a moment."
 
+        logger.info(f"✅ Latest frame available | Has YOLO: {self.latest_yolo is not None}")
+
         # Build enriched spatial context from vision history
+        logger.info("🔨 Building spatial context from vision history...")
         spatial_context = self._build_spatial_context()
+        logger.info(f"📝 Spatial context built: {len(spatial_context)} chars")
 
         # Create scene analysis with spatial context
         scene_analysis = {
@@ -455,13 +572,17 @@ class BlindAssistantService:
             "objects": self.latest_yolo.get("objects", []) if self.latest_yolo else [],
             "emergency_stop": False  # User questions aren't emergencies
         }
+        logger.info(f"📊 Scene analysis | Objects: {len(scene_analysis['objects'])}")
 
         # Conversation model gets vision context + question
+        logger.info("🤖 Calling conversation narrator.process_input...")
         response = await self.conversation_narrator.process_input(
             scene_analysis=scene_analysis,
             image_base64=self.latest_frame,
             user_question=user_question
         )
+
+        logger.info(f"✅ Got response | Should speak: {response.should_speak} | Text: '{response.full_text}' | Length: {len(response.full_text)}")
 
         return response.full_text
 
@@ -493,7 +614,7 @@ class BlindAssistantService:
 
         # If only one scene, this is likely the first few frames
         if len(recent_scenes) == 1:
-            return f"Previous: {recent_scenes[0].scene_description}"
+            return f"Previous: {self._summarize_scene(recent_scenes[0])}"
 
         # Build compact history (last 3-5 observations with timing)
         history_items = []
@@ -506,16 +627,49 @@ class BlindAssistantService:
             else:
                 time_str = f"{seconds_ago}s ago"
 
-            # Extract just the description (remove SPEAK:/SILENT: prefix if present)
-            desc = scene.scene_description
-            if desc.startswith("SPEAK: "):
-                desc = desc[7:].strip()
-            elif desc.startswith("SILENT: "):
-                desc = desc[8:].strip()
-
+            desc = self._summarize_scene(scene)
             history_items.append(f"[{time_str}] {desc}")
 
         return "\n".join(history_items)
+
+    def _summarize_scene(self, scene: SceneSnapshot) -> str:
+        """
+        Build a useful summary from a scene snapshot.
+
+        For frames where Gemini spoke, uses the actual response.
+        For silent frames, builds a summary from YOLO data.
+        """
+        desc = scene.scene_description
+
+        # If we have a real Gemini response (not a heuristics reason), use it
+        if desc and not desc.startswith("Clear path") and not desc.startswith("In path:") \
+                and not desc.startswith("Immediate:") and not desc.startswith("New:") \
+                and not desc.startswith("Emergency"):
+            # This is likely an actual Gemini response
+            if desc.startswith("SPEAK: "):
+                return desc[7:].strip()
+            return desc
+
+        # For silent frames or heuristic-only frames, build from YOLO data
+        objects = scene.yolo_objects.get("objects", [])
+        if not objects:
+            return "Clear path"
+
+        # Build compact object summary
+        obj_summaries = []
+        for obj in objects[:4]:  # Max 4 objects
+            label = obj.get("label", "object")
+            pos = obj.get("position", "")
+            dist = obj.get("distance", "")
+
+            if pos and dist:
+                obj_summaries.append(f"{label} ({pos}, {dist})")
+            elif pos:
+                obj_summaries.append(f"{label} ({pos})")
+            else:
+                obj_summaries.append(label)
+
+        return ", ".join(obj_summaries) if obj_summaries else "Clear path"
 
     def _check_immediate_danger(self, yolo_objects: Dict[str, Any]) -> Optional[str]:
         """
@@ -550,6 +704,31 @@ class BlindAssistantService:
                 return f"Careful! Stairs {position}!"
 
         return None
+
+    def _get_recent_object_labels(self, lookback_seconds: float = 10.0) -> set[str]:
+        """
+        Get labels of objects seen in the recent past for debouncing.
+
+        Args:
+            lookback_seconds: How far back to look (default 10 seconds)
+
+        Returns:
+            Set of object labels seen recently
+        """
+        if not self.scene_history:
+            return set()
+
+        cutoff_time = time.time() - lookback_seconds
+        recent_labels: set[str] = set()
+
+        for scene in self.scene_history:
+            if scene.timestamp >= cutoff_time:
+                for obj in scene.yolo_objects.get("objects", []):
+                    label = obj.get("label")
+                    if label:
+                        recent_labels.add(label)
+
+        return recent_labels
 
     def _build_spatial_context(self) -> str:
         """

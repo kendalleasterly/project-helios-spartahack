@@ -10,19 +10,26 @@ import { Button, Modal, ScrollView, StyleSheet, Text, View } from "react-native"
 import { useSafeAreaInsets } from "react-native-safe-area-context"
 
 type StatusMeta = {
-	label: string
-	color: string
-	bg: string
-}
+  label: string;
+  color: string;
+  bg: string;
+};
+
+type TTSStatus = {
+  isSpeaking: boolean;
+  isReady: boolean;
+  isInitializing: boolean;
+  error: string | null;
+};
 
 type AudioStreamViewProps = {
-	state: AudioStreamViewState
-	actions: AudioStreamViewActions
-	backendStatus: BackendStatus
-	onSendFrame: (base64Frame: string, debug?: boolean) => void
-	isDiagnosticsVisible: boolean
-	onToggleDiagnostics: () => void
-}
+  state: AudioStreamViewState;
+  actions: AudioStreamViewActions;
+  backendStatus: BackendStatus;
+  onSendFrame: (base64Frame: string, debug?: boolean) => void;
+  isDiagnosticsVisible: boolean;
+  onToggleDiagnostics: () => void;
+};
 
 const getMicStatusMeta = (status: StreamStatus): StatusMeta => {
 	switch (status) {
@@ -55,109 +62,91 @@ const getDeepgramStatusMeta = (status: DeepgramStatus): StatusMeta => {
 }
 
 const getBackendStatusMeta = (status: BackendStatus): StatusMeta => {
-	switch (status) {
-		case "connected":
-			return { label: "Backend Connected", color: "#0F766E", bg: "#CCFBF1" }
-		case "connecting":
-			return { label: "Backend Connecting", color: "#B45309", bg: "#FEF3C7" }
-		case "error":
-			return { label: "Backend Error", color: "#B91C1C", bg: "#FEE2E2" }
-		case "disconnected":
-		default:
-			return { label: "Backend Disconnected", color: "#334155", bg: "#E2E8F0" }
-	}
-}
+  switch (status) {
+    case "connected":
+      return { label: "Backend Connected", color: "#0F766E", bg: "#CCFBF1" };
+    case "connecting":
+      return { label: "Backend Connecting", color: "#B45309", bg: "#FEF3C7" };
+    case "error":
+      return { label: "Backend Error", color: "#B91C1C", bg: "#FEE2E2" };
+    case "disconnected":
+    default:
+      return { label: "Backend Disconnected", color: "#334155", bg: "#E2E8F0" };
+  }
+};
 
 export const AudioStreamView = ({
-	state,
-	actions,
-	backendStatus,
-	onSendFrame,
-	isDiagnosticsVisible,
-	onToggleDiagnostics,
+  state,
+  actions,
+  backendStatus,
+  onSendFrame,
+  isDiagnosticsVisible,
+  onToggleDiagnostics,
 }: AudioStreamViewProps) => {
-	const micStatusMeta = getMicStatusMeta(state.status)
-	const deepgramStatusMeta = getDeepgramStatusMeta(state.deepgramStatus)
-	const backendStatusMeta = getBackendStatusMeta(backendStatus)
-	const frameSampleRate = state.lastFrame ? state.lastFrame.sampleRate : null
-	const diagnosticsLabel = isDiagnosticsVisible
-		? "Hide Diagnostics"
-		: "Audio Diagnostics"
-	const insets = useSafeAreaInsets()
-	const overlayInsetStyle = {
-		paddingTop: insets.top + 16,
-		paddingBottom: insets.bottom + 16,
-		paddingLeft: insets.left + 16,
-		paddingRight: insets.right + 16,
-	}
-	const modalContentInsetStyle = {
-		paddingBottom: 32 + insets.bottom,
-	}
+  const micStatusMeta = getMicStatusMeta(state.status);
+  const deepgramStatusMeta = getDeepgramStatusMeta(state.deepgramStatus);
+  const backendStatusMeta = getBackendStatusMeta(backendStatus);
+  const frameSampleRate = state.lastFrame ? state.lastFrame.sampleRate : null;
+  const diagnosticsLabel = isDiagnosticsVisible
+    ? "Hide Diagnostics"
+    : "Audio Diagnostics";
 
-	return (
-		<View style={styles.screen}>
-			<View style={styles.cameraLayer}>
-				<CameraView onFrame={onSendFrame} />
-			</View>
-			<View
-				style={[styles.overlay, overlayInsetStyle]}
-				pointerEvents="box-none"
-			>
-				<View style={styles.statusRow}>
-					<View style={[styles.pill, { backgroundColor: micStatusMeta.bg }]}>
-						<View
-							style={[
-								styles.statusDot,
-								{ backgroundColor: micStatusMeta.color },
-							]}
-						/>
-						<Text style={[styles.pillText, { color: micStatusMeta.color }]}>
-							{micStatusMeta.label}
-						</Text>
-					</View>
-					<View
-						style={[styles.pill, { backgroundColor: backendStatusMeta.bg }]}
-					>
-						<View
-							style={[
-								styles.statusDot,
-								{ backgroundColor: backendStatusMeta.color },
-							]}
-						/>
-						<Text style={[styles.pillText, { color: backendStatusMeta.color }]}>
-							{backendStatusMeta.label}
-						</Text>
-					</View>
-					<View
-						style={[styles.pill, { backgroundColor: deepgramStatusMeta.bg }]}
-					>
-						<View
-							style={[
-								styles.statusDot,
-								{ backgroundColor: deepgramStatusMeta.color },
-							]}
-						/>
-						<Text
-							style={[styles.pillText, { color: deepgramStatusMeta.color }]}
-						>
-							{deepgramStatusMeta.label}
-						</Text>
-					</View>
-				</View>
-				<View style={styles.controlPanel}>
-					<View style={styles.controls}>
-						<View style={styles.buttonWrap}>
-							<Button title="Start Stream" onPress={actions.onStart} />
-						</View>
-						<View style={styles.buttonWrap}>
-							<Button title="Stop Stream" onPress={actions.onStop} />
-						</View>
-					</View>
-					<View style={styles.buttonRow}>
-						<Button title={diagnosticsLabel} onPress={onToggleDiagnostics} />
-					</View>
-				</View>
-			</View>
+  return (
+    <SafeAreaView style={styles.screen}>
+      <View style={styles.cameraLayer}>
+        <CameraView onFrame={onSendFrame} />
+      </View>
+      <View style={styles.overlay} pointerEvents="box-none">
+        <View style={styles.statusRow}>
+          <View style={[styles.pill, { backgroundColor: micStatusMeta.bg }]}>
+            <View
+              style={[
+                styles.statusDot,
+                { backgroundColor: micStatusMeta.color },
+              ]}
+            />
+            <Text style={[styles.pillText, { color: micStatusMeta.color }]}>
+              {micStatusMeta.label}
+            </Text>
+          </View>
+          <View style={[styles.pill, { backgroundColor: backendStatusMeta.bg }]}>
+            <View
+              style={[
+                styles.statusDot,
+                { backgroundColor: backendStatusMeta.color },
+              ]}
+            />
+            <Text style={[styles.pillText, { color: backendStatusMeta.color }]}>
+              {backendStatusMeta.label}
+            </Text>
+          </View>
+          <View style={[styles.pill, { backgroundColor: deepgramStatusMeta.bg }]}>
+            <View
+              style={[
+                styles.statusDot,
+                { backgroundColor: deepgramStatusMeta.color },
+              ]}
+            />
+            <Text style={[styles.pillText, { color: deepgramStatusMeta.color }]}>
+              {deepgramStatusMeta.label}
+            </Text>
+          </View>
+        </View>
+
+        <View style={styles.controlPanel}>
+          <View style={styles.controls}>
+            <View style={styles.buttonWrap}>
+              <Button title="Start Stream" onPress={actions.onStart} />
+            </View>
+            <View style={styles.buttonWrap}>
+              <Button title="Stop Stream" onPress={actions.onStop} />
+            </View>
+          </View>
+          <View style={styles.buttonRow}>
+            <Button title={diagnosticsLabel} onPress={onToggleDiagnostics} />
+          </View>
+        </View>
+      </View>
 
 			<Modal
 				animationType="slide"

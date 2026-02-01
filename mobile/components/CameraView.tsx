@@ -7,26 +7,29 @@ import {
 } from "react-native-vision-camera";
 import { manipulateAsync, SaveFormat } from "expo-image-manipulator";
 
-const FRAME_RATE = 1;
-const TARGET_WIDTH = 720;  // 720p for portrait mode (720x1280 after rotation)
+const FRAME_RATE = 10;
+const TARGET_WIDTH = 720;  // 720p for Gemini quality
 const TARGET_HEIGHT = 1280;
 
 type CameraViewProps = {
   onFrame: (base64Frame: string, userQuestion?: string, debug?: boolean) => void;
   getPendingQuestion?: () => string | undefined;
+  onFrameCaptured?: (base64Frame: string) => void;
 };
 
-export default function CameraView({ onFrame, getPendingQuestion }: CameraViewProps) {
+export default function CameraView({ onFrame, getPendingQuestion, onFrameCaptured }: CameraViewProps) {
   const { hasPermission, requestPermission } = useCameraPermission();
   const [isActive, setIsActive] = useState(false);
   const device = useCameraDevice("back");
   const camera = useRef<Camera>(null);
   const captureInterval = useRef<ReturnType<typeof setInterval> | null>(null);
+  const isCapturing = useRef(false);
 
   const captureFrame = useCallback(async () => {
-    if (camera.current == null) return;
+    if (camera.current == null || isCapturing.current) return;
 
     try {
+      isCapturing.current = true;
       const photo = await camera.current.takePhoto({
         enableShutterSound: false,
       });
@@ -36,7 +39,7 @@ export default function CameraView({ onFrame, getPendingQuestion }: CameraViewPr
       const resized = await manipulateAsync(
         photo.path,
         [{ resize: { width: TARGET_WIDTH, height: TARGET_HEIGHT } }],
-        { compress: 0.8, format: SaveFormat.JPEG }
+        { compress: 0.7, format: SaveFormat.JPEG }
       );
 
       const response = await fetch(resized.uri);
@@ -47,6 +50,11 @@ export default function CameraView({ onFrame, getPendingQuestion }: CameraViewPr
         const base64 = reader.result as string;
         const base64Data = base64.split(",")[1];
         
+        // Notify about frame capture (for person memory)
+        if (onFrameCaptured) {
+          onFrameCaptured(base64Data);
+        }
+
         // Check for pending question from wake word detection
         const pendingQuestion = getPendingQuestion?.();
         
@@ -55,9 +63,9 @@ export default function CameraView({ onFrame, getPendingQuestion }: CameraViewPr
             `Frame captured with question: ${photo.width}x${photo.height} → ${resized.width}x${resized.height}, question: "${pendingQuestion}"`,
           );
         } else {
-          console.log(
-            `Frame captured: ${photo.width}x${photo.height} → ${resized.width}x${resized.height}, base64 length: ${base64Data.length}`,
-          );
+          // console.log(
+          //   `Frame captured: ${photo.width}x${photo.height} → ${resized.width}x${resized.height}, base64 length: ${base64Data.length}`,
+          // );
         }
 
         onFrame(base64Data, pendingQuestion);
@@ -66,8 +74,10 @@ export default function CameraView({ onFrame, getPendingQuestion }: CameraViewPr
       reader.readAsDataURL(blob);
     } catch (error) {
       console.error("Error capturing frame:", error);
+    } finally {
+      isCapturing.current = false;
     }
-  }, [onFrame, getPendingQuestion]);
+  }, [onFrame, getPendingQuestion, onFrameCaptured]);
 
   useEffect(() => {
     if (hasPermission === false) {

@@ -9,7 +9,7 @@ approaching objects, or genuinely new information.
 """
 
 from dataclasses import dataclass, field
-from typing import Set
+from typing import Set, Optional
 from enum import Enum
 
 
@@ -34,49 +34,46 @@ class SpeakDecision:
 class HeuristicsConfig:
     """Tunable parameters for the heuristics engine."""
     # Debounce: minimum seconds between INFO-level speech
-    info_debounce_seconds: float = 10.0  # Was 3.0 - increased to reduce chatter
+    info_debounce_seconds: float = 10.0
 
     # Debounce: minimum seconds between any non-urgent speech
-    min_speech_interval_seconds: float = 2.0  # Don't speak more than once per 2s
+    min_speech_interval_seconds: float = 2.0
 
-    # Motion: When stationary, be much quieter (only emergencies/approaching)
-    stationary_info_debounce_seconds: float = 30.0  # Rarely speak when still
-    stationary_skip_path_hazards: bool = True  # Don't warn about static obstacles
+    # Motion: When stationary, be much quieter
+    stationary_info_debounce_seconds: float = 30.0
+    stationary_skip_path_hazards: bool = True
 
-    # Objects that warrant proactive speaking (reduced set - only real hazards/goals)
+    # Fast movement threshold (m/s)
+    fast_movement_threshold_mps: float = 0.1
+
+    # Objects that warrant proactive speaking
     important_objects: Set[str] = field(default_factory=lambda: {
-        # Navigation landmarks
         "door", "stairs", "elevator",
-        # Vehicles (safety critical)
         "car", "truck", "bus", "motorcycle",
-        # People (social awareness)
         "person",
     })
 
-    # Objects that are hazards when in path (triggers GUIDANCE)
+    # Objects that are hazards when in path
     path_hazards: Set[str] = field(default_factory=lambda: {
         "chair", "table", "bench", "couch", "sofa",
         "bicycle", "dog", "cat",
         "suitcase", "backpack", "box",
+        "pole", "pillar", "wall", "obstacle"
     })
 
     # Positions considered "in walking path"
-    path_positions: Set[str] = field(default_factory=lambda: {
-        "center", "mid-center", "bottom-center"
-    })
+    # Now uses the oval intersection logic ("path") instead of grid
+    path_positions: Set[str] = field(default_factory=lambda: {"path"})
 
-    # Distance thresholds (if using numeric distances)
+    # Distance thresholds
     immediate_threshold_feet: float = 3.0
     close_threshold_feet: float = 8.0
 
 
 # Default sets for use without config
 IMPORTANT_OBJECTS: Set[str] = {
-    # Navigation landmarks
     "door", "stairs", "elevator",
-    # Vehicles (safety critical)
     "car", "truck", "bus", "motorcycle",
-    # People (social awareness)
     "person",
 }
 
@@ -84,126 +81,58 @@ PATH_HAZARDS: Set[str] = {
     "chair", "table", "bench", "couch", "sofa",
     "bicycle", "dog", "cat",
     "suitcase", "backpack", "box",
+    "pole", "pillar", "wall", "obstacle"
 }
 
-PATH_POSITIONS: Set[str] = {"center", "mid-center", "bottom-center"}
+PATH_POSITIONS: Set[str] = {"path"}
 
+
+# Objects that trigger immediate STOP warnings (IDs: 0, 13, 56, 57, 62)
+WARNING_TRIGGER_LABELS: Set[str] = {
+    "person", "bench", "chair", "couch", "sofa", "tv", "monitor"
+}
 
 def evaluate_scene(
     scene_analysis: dict,
     recent_objects: Set[str],
     last_spoke_seconds_ago: float,
-    config: HeuristicsConfig | None = None
+    config: Optional[HeuristicsConfig] = None
 ) -> SpeakDecision:
     """
     Evaluate YOLO scene data and decide if Gemini should be called.
-
-    Args:
-        scene_analysis: YOLO detection results with structure:
-            {
-                "objects": [{"label": str, "distance": str, "position": str}, ...],
-                "emergency_stop": bool,
-                "motion": {
-                    "is_moving": bool,           # From step detector/accelerometer
-                    "speed_mps": float | None,   # Meters per second (optional)
-                    "speed_avg_1s_mps": float | None,
-                    "steps_last_3s": int,        # Steps in last ~3 seconds (optional)
-                    "velocity_x_mps": float | None,
-                    "velocity_z_mps": float | None,
-                    "magnetic_x_ut": int | None,
-                    "magnetic_z_ut": int | None,
-                }
-            }
-        recent_objects: Object labels seen in last N seconds (for debouncing)
-        last_spoke_seconds_ago: Time since last speech output
-        config: Optional HeuristicsConfig for tuning (uses defaults if None)
-
-    Returns:
-        SpeakDecision with should_speak, urgency, and reason
+    DEBUG MODE: If object in oval AND moving > 0.1 m/s AND object is dangerous, YELL.
     """
     if config is None:
         config = HeuristicsConfig()
 
     objects = scene_analysis.get("objects", [])
-    emergency = scene_analysis.get("emergency_stop", False)
-
-    # Motion awareness: default to moving (safer - will speak more)
     motion = scene_analysis.get("motion", {})
-    is_moving = motion.get("is_moving", True)
-
-    # URGENT: Emergency flag - highest priority (always speaks immediately)
-    if emergency:
+    
+    # 1. Determine if moving
+    speed = motion.get("speed_mps", 0.0) or 0.0
+    steps = motion.get("steps_last_3s", 0) or 0
+    is_moving = speed > 0.1 or steps > 0
+    
+    # 2. Check for DANGEROUS objects in the path
+    # Must be in the oval ("path") AND be in our specific warning list
+    path_objects = [
+        o for o in objects
+        if o.get("position") == "path" 
+        and o.get("label") in WARNING_TRIGGER_LABELS
+    ]
+    
+    # 3. Trigger only if BOTH are true
+    if is_moving and path_objects:
+        labels = [o.get("label", "object") for o in path_objects]
         return SpeakDecision(
             should_speak=True,
             urgency=UrgencyLevel.URGENT,
-            reason="Emergency detected"
+            reason=f"STOP: {', '.join(labels)} ahead"
         )
 
-    # ALERT: Immediate distance (< 3 feet) - very high priority
-    # Only for actual hazards, not every object
-    immediate_objects = [o for o in objects if o.get("distance") == "immediate"]
-    if immediate_objects:
-        # Filter to only hazardous immediate objects
-        hazardous_immediate = [
-            o for o in immediate_objects
-            if o.get("label") in config.important_objects
-            or o.get("label") in config.path_hazards
-            or o.get("label") in {"wall", "pole", "pillar", "obstacle"}
-        ]
-        if hazardous_immediate:
-            labels = [o.get("label", "object") for o in hazardous_immediate]
-            return SpeakDecision(
-                should_speak=True,
-                urgency=UrgencyLevel.ALERT,
-                reason=f"Immediate: {', '.join(labels)}"
-            )
-
-    # Global debounce: don't speak too frequently (except URGENT)
-    if last_spoke_seconds_ago < config.min_speech_interval_seconds:
-        return SpeakDecision(
-            should_speak=False,
-            urgency=UrgencyLevel.SILENT,
-            reason="Clear path, no changes"
-        )
-
-    # GUIDANCE: Close HAZARDS in walking path (not just any object)
-    # Skip when stationary - user isn't walking into static obstacles
-    if is_moving or not config.stationary_skip_path_hazards:
-        close_hazards_in_path = [
-            o for o in objects
-            if o.get("distance") == "close"
-            and any(p in o.get("position", "") for p in config.path_positions)
-            and o.get("label") in config.path_hazards
-        ]
-        if close_hazards_in_path:
-            labels = [o.get("label", "object") for o in close_hazards_in_path]
-            return SpeakDecision(
-                should_speak=True,
-                urgency=UrgencyLevel.GUIDANCE,
-                reason=f"In path: {', '.join(labels)}"
-            )
-
-    # INFO: New important objects (debounced heavily to avoid spam)
-    # Use longer debounce when stationary
-    info_debounce = (
-        config.stationary_info_debounce_seconds
-        if not is_moving
-        else config.info_debounce_seconds
-    )
-    if last_spoke_seconds_ago > info_debounce:
-        current_labels = {o.get("label") for o in objects if o.get("label")}
-        new_important = (current_labels & config.important_objects) - recent_objects
-
-        if new_important:
-            return SpeakDecision(
-                should_speak=True,
-                urgency=UrgencyLevel.INFO,
-                reason=f"New: {', '.join(sorted(new_important))}"
-            )
-
-    # SILENT: Nothing noteworthy
+    # Otherwise silent
     return SpeakDecision(
         should_speak=False,
         urgency=UrgencyLevel.SILENT,
-        reason="Clear path, no changes"
+        reason="Clear path or stationary"
     )

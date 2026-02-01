@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import { io, Socket } from "socket.io-client";
 import { BACKEND_SERVER_URL } from "@env";
 
-const SERVER_URL = BACKEND_SERVER_URL || "https://impolite-sky-noncontemplatively.ngrok-free.dev";
+const SERVER_URL = BACKEND_SERVER_URL || "http://192.168.137.1:8000";
 console.log('WebSocket connecting to:', SERVER_URL);
 
 export type ConnectionStatus =
@@ -37,18 +37,36 @@ interface TextResponseEvent {
 
 export type TextTokenCallback = (event: TextTokenEvent) => void;
 
+export interface DetectedObject {
+  label: string;
+  confidence: number;
+  position: string;
+  distance: string;
+  box: [number, number, number, number]; // [x1, y1, x2, y2]
+}
+
+export interface DetectionUpdateEvent {
+  objects: DetectedObject[];
+  motion: any;
+  summary: string;
+  is_moving: boolean;
+  emergency: boolean;
+}
+
 interface UseWebSocketReturn {
   socket: Socket | null;
   status: ConnectionStatus;
   sendFrame: (base64Frame: string, userQuestion?: string, debug?: boolean) => void;
   sendDeviceSensors: (payload: DeviceSensorPayload) => void;
   onTextToken: (callback: TextTokenCallback) => void;
+  detectionData: DetectionUpdateEvent | null;
   connect: () => void;
   disconnect: () => void;
 }
 
 export function useWebSocket(): UseWebSocketReturn {
   const [status, setStatus] = useState<ConnectionStatus>("disconnected");
+  const [detectionData, setDetectionData] = useState<DetectionUpdateEvent | null>(null);
   const socketRef = useRef<Socket | null>(null);
   const textTokenCallbackRef = useRef<TextTokenCallback | null>(null);
 
@@ -74,6 +92,10 @@ export function useWebSocket(): UseWebSocketReturn {
 
     socket.on("connection_established", (data: unknown) => {
       console.log("Connection established:", data);
+    });
+
+    socket.on("detection_update", (data: DetectionUpdateEvent) => {
+      setDetectionData(data);
     });
 
     socket.on("disconnect", (reason: string) => {
@@ -186,6 +208,7 @@ export function useWebSocket(): UseWebSocketReturn {
     sendFrame,
     sendDeviceSensors,
     onTextToken,
+    detectionData,
     connect,
     disconnect,
   };

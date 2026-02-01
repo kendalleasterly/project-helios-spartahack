@@ -3,11 +3,19 @@ import type {
   AudioStreamViewState,
   DeepgramStatus,
   StreamStatus,
-} from "@/components/AudioStreamViewModel"
-import CameraView from "@/components/CameraView"
-import type { ConnectionStatus as BackendStatus } from "@/hooks/useWebSocket"
-import { Button, Modal, ScrollView, StyleSheet, Text, View } from "react-native"
-import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context"
+} from "@/components/AudioStreamViewModel";
+import type { ConnectionStatus as BackendStatus, DetectionUpdateEvent } from "@/hooks/useWebSocket";
+import CameraView from "@/components/CameraView";
+import {
+  Button,
+  Modal,
+  SafeAreaView,
+  ScrollView,
+  StyleSheet,
+  Text,
+  View,
+} from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 type StatusMeta = {
   label: string;
@@ -31,6 +39,12 @@ type AudioStreamViewProps = {
   onToggleDiagnostics: () => void;
   ttsStatus?: TTSStatus;
   getPendingQuestion?: () => string | undefined;
+  onFrameCaptured?: (base64Frame: string) => void;
+  waitingForNote?: string | null;
+  accumulatedNote?: string;
+  onFinalizeNote?: () => void;
+  onCancelNote?: () => void;
+  detectionData?: DetectionUpdateEvent | null;
   speedMps?: number;
 };
 
@@ -88,6 +102,10 @@ const getTTSStatusMeta = (tts?: TTSStatus): StatusMeta => {
 };
 
 export const AudioStreamView = ({
+  onFinalizeNote,
+  onCancelNote,
+  detectionData,
+  onFrameCaptured,
   state,
   actions,
   backendStatus,
@@ -115,10 +133,104 @@ export const AudioStreamView = ({
     paddingBottom: insets.bottom + 16,
   };
 
+  // Instantaneous speed from backend detection data
+  const instantSpeed = detectionData?.motion?.speed_mps;
+
   return (
     <SafeAreaView style={styles.screen}>
       <View style={styles.cameraLayer}>
-        <CameraView onFrame={onSendFrame} getPendingQuestion={getPendingQuestion} />
+        <CameraView 
+          onFrame={onSendFrame} 
+          getPendingQuestion={getPendingQuestion}
+          onFrameCaptured={onFrameCaptured}
+        />
+        
+        {/* Detection Overlay */}
+        <View style={StyleSheet.absoluteFill} pointerEvents="none">
+          {/* Path Detection Oval (matches server logic) */}
+          {/* We use a square + scaleY transform to get a true mathematical ellipse */}
+          {/* matching the backend's (x^2/a^2 + y^2/b^2 <= 1) logic */}
+          <View style={{
+            position: 'absolute',
+            left: '22%',
+            width: '56%',
+            aspectRatio: 1, // Start as a circle
+            top: '70%',
+            borderWidth: 2,
+            borderColor: 'rgba(255, 255, 0, 0.4)', 
+            backgroundColor: 'rgba(255, 255, 0, 0.05)',
+            borderRadius: 9999, // Perfect circle
+            transform: [
+              { translateY: 0 }, 
+              { scaleY: 2.14 } // Stretch from 56% height to 120% height (120/56 = 2.14)
+            ],
+          }} />
+          
+          {/* Excluded Bottom Region (10%) */}
+          <View style={{
+            position: 'absolute',
+            left: 0,
+            right: 0,
+            bottom: 0,
+            height: '10%',
+            backgroundColor: 'rgba(0, 0, 0, 0.3)',
+            borderTopWidth: 1,
+            borderTopColor: 'rgba(255, 0, 0, 0.3)',
+          }}>
+            <Text style={{ 
+              color: 'rgba(255,255,255,0.5)', 
+              fontSize: 10, 
+              textAlign: 'center', 
+              marginTop: 4 
+            }}>
+              Blind Spot (Too Close)
+            </Text>
+          </View>
+
+          {/* Bounding Boxes */}
+          {detectionData?.objects?.map((obj, i) => {
+            // YOLO coordinates are relative to 720x1280 frame
+            // We need to scale them to the view percentages
+            const [x1, y1, x2, y2] = obj.box;
+            const left = (x1 / 720) * 100;
+            const top = (y1 / 1280) * 100;
+            const width = ((x2 - x1) / 720) * 100;
+            const height = ((y2 - y1) / 1280) * 100;
+            
+            // Check hazards based on position (now 'path' vs 'peripheral')
+            const isPath = obj.position === 'path';
+            const isClose = obj.distance.includes('immediate') || obj.distance.includes('close');
+            const isHazard = isPath && isClose;
+            
+            const borderColor = isHazard ? 'red' : 'rgba(0, 255, 0, 0.6)';
+
+            return (
+              <View
+                key={i}
+                style={{
+                  position: 'absolute',
+                  left: `${left}%`,
+                  top: `${top}%`,
+                  width: `${width}%`,
+                  height: `${height}%`,
+                  borderWidth: 2,
+                  borderColor: borderColor,
+                  zIndex: 10,
+                }}
+              >
+                <Text style={{ 
+                  color: 'white', 
+                  backgroundColor: borderColor, 
+                  fontSize: 10, 
+                  alignSelf: 'flex-start',
+                  paddingHorizontal: 4
+                }}>
+                  {obj.label} ({obj.distance.split(' ')[0]})
+                </Text>
+              </View>
+            );
+          })}
+        </View>
       </View>
       <View style={[styles.overlay, overlayInsetStyle]} pointerEvents="box-none">
         <View style={styles.statusRow}>
@@ -166,11 +278,13 @@ export const AudioStreamView = ({
               {deepgramStatusMeta.label}
             </Text>
           </View>
-          {typeof speedMps === "number" && (
+          
+          {/* Speed Display: Instant vs Average */}
+          {(typeof speedMps === "number" || typeof instantSpeed === "number") && (
             <View style={[styles.pill, { backgroundColor: "#DBEAFE" }]}>
               <View style={[styles.statusDot, { backgroundColor: "#1D4ED8" }]} />
               <Text style={[styles.pillText, { color: "#1D4ED8" }]}>
-                Speed avg 1s {speedMps.toFixed(2)} m/s
+                Speed: {instantSpeed !== undefined ? instantSpeed.toFixed(2) : '-'} (curr) / {speedMps?.toFixed(2) ?? '-'} (avg) m/s
               </Text>
             </View>
           )}
@@ -409,4 +523,22 @@ const styles = StyleSheet.create({
 		fontSize: 12,
 		color: "#64748B",
 	},
-})
+  noteButtonWrap: {
+    flex: 1,
+  },
+  gridContainer: {
+    ...StyleSheet.absoluteFillObject,
+    flexDirection: 'row',
+    justifyContent: 'space-evenly',
+  },
+  gridLineVertical: {
+    width: 1,
+    height: '100%',
+    backgroundColor: 'rgba(255, 255, 255, 0.2)',
+  },
+  gridLineHorizontal: {
+    height: 1,
+    width: '100%',
+    backgroundColor: 'rgba(255, 255, 255, 0.2)',
+  },
+});

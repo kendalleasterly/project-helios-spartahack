@@ -422,7 +422,8 @@ class ContextConfig:
     vision_history_lookback_seconds: int = 10
 
     # Maximum number of scene snapshots to keep in memory
-    max_scene_history: int = 60  # 60 seconds @ 1 FPS
+    # Updated for 10 FPS: 600 frames = 60 seconds
+    max_scene_history: int = 600  
 
     # Object types to prioritize in spatial summaries
     priority_objects: List[str] = field(default_factory=lambda: [
@@ -548,6 +549,43 @@ class BlindAssistantService:
         # Heuristics triggered: call Gemini with urgency context
         logger.info(f"🔊 VISION SPEAKING | Urgency: {decision.urgency.value}")
 
+        # CRITICAL OPTIMIZATION: Bypass Gemini for ALL heuristic triggers
+        # We want zero latency for all proactive guidance, not just emergencies.
+        # Gemini is only used for answering user questions in conversation mode.
+        logger.info(f"🚀 FAST PATH: Skipping Gemini for {decision.urgency.name} message")
+        
+        # Use the heuristic reason directly as the speech output
+        # Clean up the text if needed (e.g. "Immediate: door" -> "Head's up, door nearby")
+        response_text = decision.reason
+        
+        # Simple cleanup for common patterns
+        if response_text.startswith("Immediate:"):
+            response_text = f"Careful! {response_text[10:].strip()}."
+        elif response_text.startswith("New:"):
+            # Make "New: person" sound more natural -> "Person."
+            response_text = response_text[5:].strip()
+        elif response_text.startswith("Path blocked:"):
+             # "Path blocked: chair" -> "Chair in path."
+             response_text = response_text.replace("Path blocked:", "").strip() + " in path."
+            
+        self.last_spoke_time = current_time
+        
+        # Update history with what we are about to say
+        self.scene_history[-1] = SceneSnapshot(
+            timestamp=current_time,
+            yolo_objects=yolo_objects,
+            scene_description=response_text,
+            frame_base64=frame_base64 if self.config.store_frames else None
+        )
+        
+        # Also manually add to narrator history so Gemini knows we said it next time
+        # (Mocking a model turn)
+        self.vision_narrator._add_to_history("user", "System Event: Heuristics triggered warning.")
+        self.vision_narrator._add_to_history("model", f"SPEAK: {response_text}")
+        
+        return response_text
+
+        # (Code below is now unreachable in normal flow but kept structure)
         # Build scene analysis with urgency context for Gemini
         scene_with_urgency = {
             **yolo_objects,

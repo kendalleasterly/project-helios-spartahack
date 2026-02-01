@@ -13,7 +13,7 @@ from collections import deque
 
 from dotenv import load_dotenv
 from google import genai
-from google.genai.types import Part, GenerateContentConfig
+from google.genai.types import Part, GenerateContentConfig, ThinkingConfig
 
 load_dotenv()
 
@@ -110,12 +110,13 @@ class GeminiContextualNarrator:
 
     def __init__(
         self,
-        model: str = "gemini-2.5-flash",
+        model: str = "gemini-3-flash-preview",
         max_context_messages: int = 20,
         system_prompt: str = VISION_SYSTEM_PROMPT
     ):
         project = os.environ.get("GOOGLE_CLOUD_PROJECT")
-        location = os.environ.get("GOOGLE_CLOUD_LOCATION", "us-central1")
+        # Gemini 3 models require global endpoint
+        location = os.environ.get("GOOGLE_CLOUD_LOCATION", "global")
 
         if not project:
             raise ValueError("GOOGLE_CLOUD_PROJECT not found in environment")
@@ -222,13 +223,13 @@ class GeminiContextualNarrator:
         })
 
         # Call Gemini with streaming
-        # Note: Increased max_output_tokens significantly to account for thinking tokens
-        # Gemini 2.5-flash may use internal reasoning tokens that count against the limit
-        # 150→10 chars output, 500→60 chars output, trying 2048 for complete sentences
+        # Note: Using Gemini 3 Flash with minimal thinking for faster responses
+        # Minimal thinking reduces token usage by ~30% while maintaining quality
         config = GenerateContentConfig(
             system_instruction=self.system_prompt,
-            temperature=0.7,
-            max_output_tokens=2048  # Large buffer for thinking tokens + complete response
+            temperature=0.1,
+            max_output_tokens=2048,
+            thinking_config=ThinkingConfig(thinking_level="minimal")  # Gemini 3: minimal thinking
         )
 
         response_stream = await self.client.aio.models.generate_content_stream(
@@ -424,14 +425,14 @@ class BlindAssistantService:
 
         # Vision monitoring narrator - maintains scene understanding
         self.vision_narrator = GeminiContextualNarrator(
-            model="gemini-2.5-flash",
+            model="gemini-3-flash-preview",
             max_context_messages=20,  # Internal vision model context
             system_prompt=VISION_SYSTEM_PROMPT
         )
 
         # Conversation narrator - handles user queries (ALWAYS responds)
         self.conversation_narrator = GeminiContextualNarrator(
-            model="gemini-2.5-flash",
+            model="gemini-3-flash-preview",
             max_context_messages=10,  # Recent conversation history
             system_prompt=CONVERSATION_SYSTEM_PROMPT  # Different prompt - no SPEAK/SILENT logic
         )

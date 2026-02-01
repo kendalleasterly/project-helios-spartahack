@@ -67,7 +67,11 @@ gemini_vision_lock = asyncio.Lock()
 # Vehicle classes that trigger emergency warnings
 VEHICLE_CLASSES = {'car', 'bus', 'truck', 'motorcycle', 'bicycle'}
 
-# Emergency distance thresholds
+# Emergency distance thresholds (using advanced distance categories)
+# immediate: < 3 feet   | CRITICAL - stop immediately
+# close:     < 8 feet   | WARNING - high alert
+# medium:    < 15 feet  | CAUTION - monitor
+# far:       15+ feet   | SAFE - informational
 EMERGENCY_DISTANCES = {'immediate', 'close'}
 
 # Debug Recording Configuration
@@ -206,32 +210,107 @@ def calculate_3x3_position(bbox_center_x: float, bbox_center_y: float,
     return f"{vertical}-{horizontal}"
 
 
-def calculate_distance(bbox_height: float, image_height: int) -> str:
+# ============================================================================
+# ADVANCED DISTANCE ESTIMATION
+# ============================================================================
+
+# Known object heights in meters (calibrated for NAV_CLASSES detection)
+# NAV_CLASSES: [0, 13, 24, 39, 41, 42, 43, 44, 45, 56, 57, 62, 63, 64, 65, 66, 67, 73]
+OBJECT_HEIGHTS = {
+    # Primary navigation objects
+    'person': 1.7,          # ID 0 - average human height
+    'bench': 0.8,           # ID 13 - typical park bench
+    'backpack': 0.45,       # ID 24 - when standing/sitting
+    'chair': 0.9,           # ID 56 - typical chair back height
+    'couch': 0.85,          # ID 57 - sofa back height
+
+    # Tabletop/small objects (precise for close range)
+    'bottle': 0.25,         # ID 39 - water bottle
+    'cup': 0.12,            # ID 41 - coffee cup
+    'fork': 0.18,           # ID 42 - dinner fork
+    'knife': 0.20,          # ID 43 - table knife
+    'spoon': 0.18,          # ID 44 - tablespoon
+    'bowl': 0.08,           # ID 45 - cereal bowl height
+
+    # Electronics (thin objects - use thickness)
+    'tv': 0.80,             # ID 62 - average TV height (not thickness)
+    'laptop': 0.02,         # ID 63 - thickness when open
+    'mouse': 0.04,          # ID 64 - computer mouse height
+    'remote': 0.18,         # ID 65 - TV remote
+    'keyboard': 0.03,       # ID 66 - keyboard thickness
+    'cell phone': 0.15,     # ID 67 - phone standing up
+    'book': 0.23,           # ID 73 - average book standing
+
+    # Vehicles (for emergency detection - VEHICLE_CLASSES)
+    'car': 1.5,             # Average car height
+    'truck': 2.5,           # Pickup/delivery truck
+    'bus': 3.0,             # City bus
+    'motorcycle': 1.2,      # Motorcycle height
+    'bicycle': 1.1,         # Bicycle height
+
+    # Default for unknown objects
+    'default': 1.0
+}
+
+# iPhone 15 Pro camera intrinsics (exact specifications)
+# Source: Apple specs + DPReview teardown analysis
+IPHONE_FOCAL_LENGTH_MM = 6.86     # Wide camera physical focal length (24mm equiv)
+IPHONE_SENSOR_HEIGHT_MM = 7.3     # Main sensor height (Type 1/1.28, 9.8x7.3mm)
+IPHONE_IMAGE_HEIGHT_PX = 720      # Actual incoming resolution (downscaled from native)
+
+# Calculate focal length in pixels using pinhole camera model
+# This converts physical mm to pixel space for distance calculations
+# Note: Calibrated for 720p input. If resolution changes, update IPHONE_IMAGE_HEIGHT_PX
+FOCAL_LENGTH_PIXELS = (IPHONE_FOCAL_LENGTH_MM * IPHONE_IMAGE_HEIGHT_PX) / IPHONE_SENSOR_HEIGHT_MM
+
+
+def calculate_distance(bbox_height: float, image_height: int, label: str = 'default') -> str:
     """
-    Estimate object distance based on bounding box height.
+    Advanced distance estimation using object size and camera calibration.
 
-    Distance Logic (Depth Estimation):
-    - Immediate: Box height > 50% of image height (RIGHT IN FRONT)
-    - Close:     Box height > 20% of image height
-    - Far:       Box height ≤ 20% of image height
+    Uses pinhole camera model: distance = (real_height × focal_length) / pixel_height
 
-    Rationale: Larger objects in the frame are closer to the camera.
+    This provides MUCH better accuracy than simple bbox ratios by accounting for:
+    - Object type (person vs bottle have different real sizes)
+    - Camera properties (focal length, sensor size)
+    - Real-world physics (inverse square law)
 
     Args:
-        bbox_height: Height of the bounding box
-        image_height: Total height of the image
+        bbox_height: Height of bounding box in pixels
+        image_height: Total image height in pixels
+        label: Object class label (e.g., 'person', 'chair')
 
     Returns:
-        str: "immediate", "close", or "far"
+        str: Distance category and estimate (e.g., "close (5.2 feet)")
     """
-    relative_height = bbox_height / image_height
+    # Handle edge case
+    if bbox_height <= 0:
+        return "unknown"
 
-    if relative_height > 0.50:
-        return "immediate"
-    elif relative_height > 0.20:
-        return "close"
+    # Get known object height
+    real_height_m = OBJECT_HEIGHTS.get(label, OBJECT_HEIGHTS['default'])
+
+    # Adjust focal length for current image resolution
+    focal_length_adjusted = FOCAL_LENGTH_PIXELS * (image_height / IPHONE_IMAGE_HEIGHT_PX)
+
+    # Calculate distance using pinhole camera model
+    distance_meters = (real_height_m * focal_length_adjusted) / bbox_height
+
+    # Convert to feet (US users)
+    distance_feet = distance_meters * 3.28084
+
+    # Categorize with more granular buckets
+    if distance_feet < 3:
+        category = "immediate"
+    elif distance_feet < 8:
+        category = "close"
+    elif distance_feet < 15:
+        category = "medium"
     else:
-        return "far"
+        category = "far"
+
+    # Return category with numeric estimate
+    return f"{category} ({distance_feet:.1f} ft)"
 
 
 def annotate_frame(image: np.ndarray, objects: List[Dict[str, Any]],
@@ -284,19 +363,25 @@ def annotate_frame(image: np.ndarray, objects: List[Dict[str, Any]],
 
         x1, y1, x2, y2 = box
 
+        # Extract distance category from enhanced format (e.g., "close (5.2 ft)" -> "close")
+        distance_category = distance.split()[0] if distance and ' ' in distance else distance
+
         # Color code by distance and emergency status
-        if distance == 'immediate':
+        if distance_category == 'immediate':
             color = (0, 0, 255)  # Red - BGR format
             thickness = 3
-        elif distance == 'close':
+        elif distance_category == 'close':
             color = (0, 165, 255)  # Orange
             thickness = 2
-        else:
+        elif distance_category == 'medium':
+            color = (0, 255, 255)  # Yellow
+            thickness = 2
+        else:  # far
             color = (0, 255, 0)  # Green
             thickness = 2
 
         # Override to red if it's a vehicle causing emergency
-        if label in VEHICLE_CLASSES and distance in EMERGENCY_DISTANCES:
+        if label in VEHICLE_CLASSES and distance_category in EMERGENCY_DISTANCES:
             color = (0, 0, 255)  # Red
             thickness = 4
 
@@ -751,8 +836,8 @@ def process_detections(results, image_height: int, image_width: int) -> Dict[str
                 image_width, image_height
             )
 
-            # Calculate distance (depth estimation)
-            distance = calculate_distance(bbox_height, image_height)
+            # Calculate distance (advanced depth estimation with real-world units)
+            distance = calculate_distance(bbox_height, image_height, label)
 
             # Create enhanced object entry
             obj = {
@@ -760,7 +845,7 @@ def process_detections(results, image_height: int, image_width: int) -> Dict[str
                 "label": label,
                 "confidence": round(confidence, 2),
                 "position": position,  # Now 3x3 grid (e.g., "top-left", "mid-center")
-                "distance": distance,
+                "distance": distance,  # e.g., "close (5.2 ft)"
                 "box": [int(x1), int(y1), int(x2), int(y2)],
                 "cluster_id": None  # Will be assigned if part of a cluster
             }
@@ -768,7 +853,9 @@ def process_detections(results, image_height: int, image_width: int) -> Dict[str
 
             # Emergency Detection Logic
             # Trigger if vehicle is dangerously close
-            if label in VEHICLE_CLASSES and distance in EMERGENCY_DISTANCES:
+            # Extract category from distance string (e.g., "close (5.2 ft)" -> "close")
+            distance_category = distance.split()[0] if distance else "unknown"
+            if label in VEHICLE_CLASSES and distance_category in EMERGENCY_DISTANCES:
                 emergency_stop = True
                 logger.warning(
                     f"⚠️  EMERGENCY: {label} detected at {distance} distance ({position})"
@@ -1100,6 +1187,20 @@ async def video_frame_streaming(sid, data):
         objects = detection_data['objects']
         clusters = detection_data['clusters']
         emergency_stop = detection_data['emergency_stop']
+
+        # Log detected objects with distances for testing/debugging
+        if objects:
+            logger.info(f"📦 Detected {len(objects)} objects:")
+            for obj in objects[:10]:  # Log first 10 objects to avoid spam
+                label = obj.get('label', 'unknown')
+                distance = obj.get('distance', 'unknown')
+                position = obj.get('position', 'unknown')
+                confidence = obj.get('confidence', 0.0)
+                logger.info(f"   • {label.upper()}: {distance} | {position} | conf={confidence:.0%}")
+            if len(objects) > 10:
+                logger.info(f"   ... and {len(objects) - 10} more objects")
+        else:
+            logger.debug("📦 No objects detected")
 
         # Step 4: Generate summary
         summary = generate_summary(objects, clusters)

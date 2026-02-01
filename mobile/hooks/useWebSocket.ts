@@ -3,6 +3,7 @@ import { io, Socket } from "socket.io-client";
 import { BACKEND_SERVER_URL } from "@env";
 
 const SERVER_URL = BACKEND_SERVER_URL || "http://192.168.137.1:8000";
+console.log('WebSocket connecting to:', SERVER_URL);
 
 export type ConnectionStatus =
   | "disconnected"
@@ -10,10 +11,26 @@ export type ConnectionStatus =
   | "connected"
   | "error";
 
+export interface TextTokenEvent {
+  token: string;
+  emergency: boolean;
+  is_first: boolean;
+}
+
+// Backend main branch sends text_response events with this format
+interface TextResponseEvent {
+  text: string;
+  mode: "vision" | "conversation";
+  emergency: boolean;
+}
+
+export type TextTokenCallback = (event: TextTokenEvent) => void;
+
 interface UseWebSocketReturn {
   socket: Socket | null;
   status: ConnectionStatus;
-  sendFrame: (base64Frame: string, debug?: boolean) => void;
+  sendFrame: (base64Frame: string, userQuestion?: string, debug?: boolean) => void;
+  onTextToken: (callback: TextTokenCallback) => void;
   connect: () => void;
   disconnect: () => void;
 }
@@ -21,6 +38,7 @@ interface UseWebSocketReturn {
 export function useWebSocket(): UseWebSocketReturn {
   const [status, setStatus] = useState<ConnectionStatus>("disconnected");
   const socketRef = useRef<Socket | null>(null);
+  const textTokenCallbackRef = useRef<TextTokenCallback | null>(null);
 
   const connect = useCallback(() => {
     if (socketRef.current?.connected) {
@@ -64,6 +82,48 @@ export function useWebSocket(): UseWebSocketReturn {
       setStatus("connecting");
     });
 
+    // Listen for streaming text_token events (feature/audio-tts branch backend)
+    socket.on("text_token", (data: TextTokenEvent) => {
+      console.log('[WebSocket] text_token received:', JSON.stringify(data));
+      if (textTokenCallbackRef.current) {
+        textTokenCallbackRef.current(data);
+      } else {
+        console.warn('[WebSocket] text_token received but no callback registered');
+      }
+    });
+
+    // Listen for complete text_response events (main branch backend)
+    // Convert to TextTokenEvent format for TTS pipeline compatibility
+    socket.on("text_response", (data: TextResponseEvent) => {
+      console.log('[WebSocket] text_response received:', JSON.stringify(data));
+      if (textTokenCallbackRef.current && data.text) {
+        // Send the complete text as a single token with sentence terminator
+        // This ensures the text buffer will flush and trigger TTS
+        const textWithPunctuation = data.text.endsWith('.') || 
+                                    data.text.endsWith('!') || 
+                                    data.text.endsWith('?') 
+          ? data.text 
+          : data.text + '.';
+        
+        textTokenCallbackRef.current({
+          token: textWithPunctuation,
+          emergency: data.emergency,
+          is_first: true,
+        });
+        console.log('[WebSocket] Converted text_response to text_token for TTS');
+      } else if (!textTokenCallbackRef.current) {
+        console.warn('[WebSocket] text_response received but no callback registered');
+      }
+    });
+
+    // Log all events for debugging - helps identify what backend is sending
+    socket.onAny((eventName: string, ...args: unknown[]) => {
+      if (eventName !== 'text_token' && eventName !== 'text_response' && 
+          eventName !== 'connect' && eventName !== 'disconnect') {
+        console.log(`[WebSocket] Event "${eventName}":`, JSON.stringify(args).slice(0, 200));
+      }
+    });
+
     socketRef.current = socket;
   }, []);
 
@@ -75,13 +135,25 @@ export function useWebSocket(): UseWebSocketReturn {
     }
   }, []);
 
-  const sendFrame = useCallback((base64Frame: string, debug = false) => {
+  const sendFrame = useCallback((base64Frame: string, userQuestion?: string, debug = false) => {
     if (socketRef.current?.connected) {
-      socketRef.current.emit("video_frame", {
+      if (userQuestion) {
+        console.log(`Sending frame with question to backend: "${userQuestion}"`);
+      } else {
+        console.log(`Sending frame to backend (${base64Frame.length} bytes)`);
+      }
+      socketRef.current.emit("video_frame_streaming", {
         frame: base64Frame,
+        user_question: userQuestion,
         debug,
       });
+    } else {
+      console.warn('Cannot send frame: socket not connected');
     }
+  }, []);
+
+  const onTextToken = useCallback((callback: TextTokenCallback) => {
+    textTokenCallbackRef.current = callback;
   }, []);
 
   useEffect(() => {
@@ -94,6 +166,7 @@ export function useWebSocket(): UseWebSocketReturn {
     socket: socketRef.current,
     status,
     sendFrame,
+    onTextToken,
     connect,
     disconnect,
   };

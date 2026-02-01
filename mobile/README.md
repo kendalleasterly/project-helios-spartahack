@@ -1,4 +1,4 @@
-# a-eye mobile
+# Helios mobile
 
 Assistive navigation application for blind users using computer vision and AI.
 

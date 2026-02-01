@@ -1305,9 +1305,9 @@ async def video_frame_streaming(sid, data):
         speed_avg_1s_mps = sensor_data.get("speed_avg_1s_mps")
         is_moving_fast = False
         if speed_avg_1s_mps is not None:
-            is_moving_fast = speed_avg_1s_mps >= 0.3
+            is_moving_fast = speed_avg_1s_mps >= 0.1
         elif speed_mps is not None:
-            is_moving_fast = speed_mps >= 0.3
+            is_moving_fast = speed_mps >= 0.1
         elif steps_last_3s is not None:
             is_moving_fast = steps_last_3s > 0
 
@@ -1320,12 +1320,16 @@ async def video_frame_streaming(sid, data):
             and "center" in (obj.get("position") or "")
         ]
         if is_moving_fast and close_in_path:
+            first_hazard = close_in_path[0]
+            label = first_hazard.get("label", "object")
+            position = first_hazard.get("position", "ahead")
+            distance = first_hazard.get("distance", "close")
             labels = [obj.get("label", "object") for obj in close_in_path[:3]]
             print(f"🛑 Immediate STOP | speed={speed_mps} m/s | hazards={labels}")
             await sio.emit(
                 'text_response',
                 {
-                    'text': 'STOP',
+                    'text': f"STOP. {label} {position}, {distance}.",
                     'mode': 'vision',
                     'emergency': True
                 },

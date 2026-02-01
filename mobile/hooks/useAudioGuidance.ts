@@ -120,12 +120,12 @@ export function useAudioGuidance({ onTextToken, enabled = true }: UseAudioGuidan
     textBuffer.onSentence(({ sentence, emergency }) => {
       console.log(`[AudioGuidance] Sentence received: "${sentence}" (emergency: ${emergency})`);
 
-      const normalized = sentence.trim().replace(/[.!?]+$/, '').toUpperCase();
-      if (normalized === 'STOP') {
+      const normalized = sentence.trim().toUpperCase();
+      if (normalized.startsWith('STOP')) {
         const now = Date.now();
         const lastStopAt = lastStopAtRef.current;
-        if (lastStopAt && now - lastStopAt < 3000) {
-          console.log('[AudioGuidance] Suppressing repeated STOP within 3s');
+        if (lastStopAt && now - lastStopAt < 2000) {
+          console.log('[AudioGuidance] Suppressing repeated STOP within 2s');
           return;
         }
         lastStopAtRef.current = now;

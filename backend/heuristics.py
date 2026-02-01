@@ -3,10 +3,13 @@ Heuristics Engine for Project Helios v2
 
 Decides WHEN to call Gemini based on YOLO detection data.
 Gemini then decides WHAT to say.
+
+Motion-aware: When user is stationary, only speaks for emergencies,
+approaching objects, or genuinely new information.
 """
 
 from dataclasses import dataclass, field
-from typing import Set
+from typing import Set, Optional
 from enum import Enum
 
 
@@ -31,124 +34,105 @@ class SpeakDecision:
 class HeuristicsConfig:
     """Tunable parameters for the heuristics engine."""
     # Debounce: minimum seconds between INFO-level speech
-    info_debounce_seconds: float = 3.0
+    info_debounce_seconds: float = 10.0
+
+    # Debounce: minimum seconds between any non-urgent speech
+    min_speech_interval_seconds: float = 2.0
+
+    # Motion: When stationary, be much quieter
+    stationary_info_debounce_seconds: float = 30.0
+    stationary_skip_path_hazards: bool = True
+
+    # Fast movement threshold (m/s)
+    fast_movement_threshold_mps: float = 0.1
 
     # Objects that warrant proactive speaking
     important_objects: Set[str] = field(default_factory=lambda: {
-        # Navigation
-        "door", "stairs", "elevator", "escalator",
-        # Seating
-        "chair", "couch", "bench", "sofa",
-        # Safety
-        "car", "truck", "bus", "motorcycle", "bicycle",
-        # People
+        "door", "stairs", "elevator",
+        "car", "truck", "bus", "motorcycle",
         "person",
-        # Hazards
-        "dog", "cat",
+    })
+
+    # Objects that are hazards when in path
+    path_hazards: Set[str] = field(default_factory=lambda: {
+        "chair", "table", "bench", "couch", "sofa",
+        "bicycle", "dog", "cat",
+        "suitcase", "backpack", "box",
+        "pole", "pillar", "wall", "obstacle"
     })
 
     # Positions considered "in walking path"
-    path_positions: Set[str] = field(default_factory=lambda: {
-        "center", "mid-center", "bottom-center"
-    })
+    # Now uses the oval intersection logic ("path") instead of grid
+    path_positions: Set[str] = field(default_factory=lambda: {"path"})
 
-    # Distance thresholds (if using numeric distances)
+    # Distance thresholds
     immediate_threshold_feet: float = 3.0
     close_threshold_feet: float = 8.0
 
 
 # Default sets for use without config
 IMPORTANT_OBJECTS: Set[str] = {
-    # Navigation
-    "door", "stairs", "elevator", "escalator",
-    # Seating
-    "chair", "couch", "bench", "sofa",
-    # Safety
-    "car", "truck", "bus", "motorcycle", "bicycle",
-    # People
+    "door", "stairs", "elevator",
+    "car", "truck", "bus", "motorcycle",
     "person",
-    # Hazards
-    "dog", "cat",
 }
 
-PATH_POSITIONS: Set[str] = {"center", "mid-center", "bottom-center"}
+PATH_HAZARDS: Set[str] = {
+    "chair", "table", "bench", "couch", "sofa",
+    "bicycle", "dog", "cat",
+    "suitcase", "backpack", "box",
+    "pole", "pillar", "wall", "obstacle"
+}
 
+PATH_POSITIONS: Set[str] = {"path"}
+
+
+# Objects that trigger immediate STOP warnings (IDs: 0, 13, 56, 57, 62)
+WARNING_TRIGGER_LABELS: Set[str] = {
+    "person", "bench", "chair", "couch", "sofa", "tv", "monitor"
+}
 
 def evaluate_scene(
     scene_analysis: dict,
     recent_objects: Set[str],
     last_spoke_seconds_ago: float,
-    config: HeuristicsConfig | None = None
+    config: Optional[HeuristicsConfig] = None
 ) -> SpeakDecision:
     """
     Evaluate YOLO scene data and decide if Gemini should be called.
-
-    Args:
-        scene_analysis: YOLO detection results with structure:
-            {
-                "objects": [{"label": str, "distance": str, "position": str}, ...],
-                "emergency_stop": bool
-            }
-        recent_objects: Object labels seen in last N seconds (for debouncing)
-        last_spoke_seconds_ago: Time since last speech output
-        config: Optional HeuristicsConfig for tuning (uses defaults if None)
-
-    Returns:
-        SpeakDecision with should_speak, urgency, and reason
+    DEBUG MODE: If object in oval AND moving > 0.1 m/s AND object is dangerous, YELL.
     """
     if config is None:
         config = HeuristicsConfig()
 
     objects = scene_analysis.get("objects", [])
-    emergency = scene_analysis.get("emergency_stop", False)
-
-    # URGENT: Emergency flag - highest priority
-    if emergency:
+    motion = scene_analysis.get("motion", {})
+    
+    # 1. Determine if moving
+    speed = motion.get("speed_mps", 0.0) or 0.0
+    steps = motion.get("steps_last_3s", 0) or 0
+    is_moving = speed > 0.1 or steps > 0
+    
+    # 2. Check for DANGEROUS objects in the path
+    # Must be in the oval ("path") AND be in our specific warning list
+    path_objects = [
+        o for o in objects
+        if o.get("position") == "path" 
+        and o.get("label") in WARNING_TRIGGER_LABELS
+    ]
+    
+    # 3. Trigger only if BOTH are true
+    if is_moving and path_objects:
+        labels = [o.get("label", "object") for o in path_objects]
         return SpeakDecision(
             should_speak=True,
             urgency=UrgencyLevel.URGENT,
-            reason="Emergency detected"
+            reason=f"STOP: {', '.join(labels)} ahead"
         )
 
-    # ALERT: Immediate distance (< 3 feet) - very high priority
-    immediate_objects = [o for o in objects if o.get("distance") == "immediate"]
-    if immediate_objects:
-        labels = [o.get("label", "object") for o in immediate_objects]
-        return SpeakDecision(
-            should_speak=True,
-            urgency=UrgencyLevel.ALERT,
-            reason=f"Immediate: {', '.join(labels)}"
-        )
-
-    # GUIDANCE: Close objects in walking path
-    close_in_path = [
-        o for o in objects
-        if o.get("distance") == "close"
-        and any(p in o.get("position", "") for p in config.path_positions)
-    ]
-    if close_in_path:
-        labels = [o.get("label", "object") for o in close_in_path]
-        return SpeakDecision(
-            should_speak=True,
-            urgency=UrgencyLevel.GUIDANCE,
-            reason=f"In path: {', '.join(labels)}"
-        )
-
-    # INFO: New important objects (debounced to avoid spam)
-    if last_spoke_seconds_ago > config.info_debounce_seconds:
-        current_labels = {o.get("label") for o in objects if o.get("label")}
-        new_important = (current_labels & config.important_objects) - recent_objects
-
-        if new_important:
-            return SpeakDecision(
-                should_speak=True,
-                urgency=UrgencyLevel.INFO,
-                reason=f"New: {', '.join(sorted(new_important))}"
-            )
-
-    # SILENT: Nothing noteworthy
+    # Otherwise silent
     return SpeakDecision(
         should_speak=False,
         urgency=UrgencyLevel.SILENT,
-        reason="Clear path, no changes"
+        reason="Clear path or stationary"
     )

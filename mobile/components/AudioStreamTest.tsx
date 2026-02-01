@@ -5,10 +5,11 @@ import { useWebSocket } from "@/hooks/useWebSocket";
 import { useAudioGuidance } from "@/hooks/useAudioGuidance";
 import { useWakeWord } from "@/hooks/useWakeWord";
 import { usePersonCommands } from "@/hooks/usePersonCommands";
+import { useDeviceSensors } from "@/hooks/useDeviceSensors";
 
 export function MicStreamTest() {
   const { state, actions } = useAudioStreamViewModel();
-  const { socket, status: backendStatus, sendFrame, connect, onTextToken } = useWebSocket();
+  const { socket, status: backendStatus, sendFrame, sendDeviceSensors, connect, onTextToken, detectionData } = useWebSocket();
   const [isDiagnosticsVisible, setIsDiagnosticsVisible] = useState(false);
   const [currentFrame, setCurrentFrame] = useState<string | null>(null);
   
@@ -16,6 +17,13 @@ export function MicStreamTest() {
   // When the array is trimmed via slice(), indices shift but we can find our place
   // by looking for the last transcript we processed.
   const lastProcessedTranscriptRef = useRef<string | null>(null);
+
+  // Enable sensor streaming (auto-sends to backend) from navigation
+  useDeviceSensors({
+    enabled: backendStatus === "connected",
+    onSensorUpdate: sendDeviceSensors,
+    updateInterval: 200, // 5Hz updates
+  });
 
   // Person memory commands - monitors transcripts for "helios remember/save/note" patterns
   const { 
@@ -115,6 +123,7 @@ export function MicStreamTest() {
       onToggleDiagnostics={handleToggleDiagnostics}
       getPendingQuestion={consumePendingQuestion}
       onFrameCaptured={handleFrameCaptured}
+      detectionData={detectionData}
       waitingForNote={waitingForNote}
       accumulatedNote={accumulatedNote}
       onFinalizeNote={finalizeNoteNow}

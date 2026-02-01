@@ -42,12 +42,26 @@ const LEAVE_NOTE_PATTERNS = [
 // Words that indicate the transcript is NOT a save person command
 // Helps avoid false positives like "remember to call" or "save that file"
 const SAVE_PERSON_EXCLUSIONS = [
-  'to ', 'that ', 'the ', 'my ', 'your ', 'this file', 'that file',
-  'it ', 'them ', 'those ', 'these ', 'what ', 'when ', 'where ', 'why ', 'how ',
+  'to ',
+  'that ',
+  'the ',
+  'my ',
+  'your ',
+  'this file',
+  'that file',
+  'it ',
+  'them ',
+  'those ',
+  'these ',
+  'what ',
+  'when ',
+  'where ',
+  'why ',
+  'how ',
 ];
 
 // Commands to finalize note immediately
-const FINALIZE_COMMANDS = ['done', 'send', 'save', 'finish', 'that\'s it', "that's all"];
+const FINALIZE_COMMANDS = ['done', 'send', 'save', 'finish', "that's it", "that's all"];
 
 // Commands to cancel note
 const CANCEL_COMMANDS = ['cancel', 'never mind', 'nevermind', 'stop', 'forget it'];

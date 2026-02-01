@@ -22,5 +22,6 @@ colorama==0.4.6
 google-genai>=1.0.0
 python-dotenv>=1.0.0
 cachetools>=5.0.0
-sounddevice>=0.4.6
+# Optional: server-side audio playback (Macs can hit arch issues). Install manually if needed.
+# sounddevice>=0.4.6
 numpy>=1.26.4

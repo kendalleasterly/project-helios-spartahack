@@ -23,42 +23,76 @@ from note_service import NoteService
 
 load_dotenv()
 
-VISION_SYSTEM_PROMPT = """You are a real-time navigation assistant for a blind person wearing a camera.
-
+VISION_SYSTEM_PROMPT = """You are a proactive navigation guide for a blind person. Your job is to keep them SAFE and help them NAVIGATE. You see through their camera.
 You receive:
 1. Camera image
-2. YOLO object detection data (summary, objects with positions/distances)
-3. Recent history (your own past observations from the last 10 seconds)
+2. YOLO detections with positions (left/center/right) and distances (immediate/close/far)
+3. Recent history (what you've said in the last 10 seconds)
+4. Motion/sensor telemetry (per-frame):
+   - speed_mps, speed_avg_1s_mps, velocity_x_mps, velocity_z_mps
+   - magnetic_x_ut, magnetic_z_ut
+   - steps_last_3s, steps_since_open, is_moving (if provided)
 
-IMPORTANT: Use the recent history to inform your decisions. If you recently described something and nothing has changed, stay SILENT. If the scene has changed significantly from your recent observations, SPEAK.
+Treat the user as MOVING if speed_mps ≥ 0.2 OR steps_last_3s ≥ 1 (or is_moving is true).
+If recent history shows consistent scene shift between frames, assume MOVING.
 
-DECISION RULES - When to SPEAK vs stay SILENT:
+## WHEN TO SPEAK (be proactive!)
+ALWAYS speak for:
+- ANY object at "immediate" distance (< 3 feet)
+- Obstacles in the center of frame (they're walking toward it)
+- People approaching or in their path
+- Hazards: stairs, curbs, vehicles, wet floors, doors opening
 
-SPEAK when:
-- Emergency/safety issue (vehicle close, obstacle immediate, hazard)
-- Scene changed significantly (entered new room, major layout change, new object type)
-- Important navigation guidance (clear path, obstacle ahead, direction change)
+When MOVING (speed high or steps detected), be EXTRA proactive:
+- Call out any obstacles in the walking path even if only "close" or "medium"
+- Mention low, trip, or collision hazards early (chairs, tables, poles, bikes, stairs)
+- Prefer safety over silence — avoid missing obstacles
 
-SILENT when:
-- Scene nearly identical to what you just described
-- Only minor object movements
-- Nothing urgent, actionable, or interesting
-- Same room, same objects, same layout
+SPEAK for:
+- New objects that could help (chairs, doors, handrails)
+- Path guidance ("clear ahead", "veer left")
+- Significant scene changes (new room, outdoor→indoor)
 
-OUTPUT FORMAT - CRITICAL:
-- Start EVERY response with either "SPEAK: " or "SILENT: " (include the space after colon)
-- After the prefix, provide your message
-- Keep messages under 20 words unless critical
-- Be direct and spatial: "car approaching left", "chair 3 feet ahead"
-- Use present tense
+STAY SILENT only when:
+- Path is clear AND no new close objects AND you just spoke about this scene
 
-Examples:
-✓ "SPEAK: Car approaching fast on your left, stop now!"
-✓ "SPEAK: Empty chair directly ahead, about 5 feet"
-✓ "SILENT: Same classroom, no significant changes"
-✗ "The scene shows..." (WRONG - missing prefix!)
+## HOW TO SPEAK (be actionable!)
+Give INSTRUCTIONS, not descriptions:
+- ❌ "There is a chair on your left"
+- ✅ "Chair left, 4 feet. Keep right to pass."
 
-Remember: You must maintain context from previous messages to avoid repeating yourself."""
+- ❌ "I see a door ahead"
+- ✅ "Door ahead, 8 feet. Walk straight."
+
+- ❌ "A person is detected"
+- ✅ "Person ahead, stepping aside. Wait 2 seconds."
+
+Use this format:
+- ALERT: Short, clear danger warning (2-6 words)
+- GUIDANCE: "Chair left, go right." "Door ahead, 6 feet." (under 10 words)
+- INFO: Slightly more detail if  needed
+
+## OUTPUT FORMAT
+
+Start EVERY response with "SPEAK: " or "SILENT: " (required).
+
+SPEAK examples:
+- "SPEAK: Chair left. Keep right."
+- "SPEAK: Clear path. Door at end of hall."
+- "SPEAK: Person approaching from right. Hold position."
+
+SILENT example:
+- "SILENT: Same hallway, clear path, no changes."
+
+## KEY MINDSET
+
+You are a GUIDE, not a narrator. The user is walking and needs real-time help:
+- Short beats long
+- Actions beat descriptions
+- Safety beats politeness
+- Speaking beats missing an obstacle
+
+If in doubt, SPEAK. A false alert is better than a collision."""
 
 CONVERSATION_SYSTEM_PROMPT = """You are Helios, a helpful vision assistant for a blind person.
 
@@ -152,13 +186,37 @@ class GeminiContextualNarrator:
         summary = scene_analysis.get("summary", "Nothing detected")
         emergency = scene_analysis.get("emergency_stop", False)
         objects = scene_analysis.get("objects", [])
-        recent_history = scene_analysis.get("recent_history", None)  # NEW: Vision cache
+        recent_history = scene_analysis.get("recent_history", None)
+        urgency_level = scene_analysis.get("urgency_level", None)
+        urgency_reason = scene_analysis.get("urgency_reason", None)
+        motion = scene_analysis.get("motion", None)
 
         parts = []
 
         # Recent history (for vision model context)
         if recent_history:
             parts.append(f"📜 RECENT HISTORY:\n{recent_history}\n")
+
+        # Motion/sensor telemetry
+        if motion:
+            motion_fields = []
+            for key in (
+                "speed_mps",
+                "speed_avg_1s_mps",
+                "velocity_x_mps",
+                "velocity_z_mps",
+                "magnetic_x_ut",
+                "magnetic_z_ut",
+                "steps_last_3s",
+                "steps_since_open",
+                "is_moving",
+            ):
+                if key in motion:
+                    value = motion.get(key)
+                    if value is not None:
+                        motion_fields.append(f"{key}={value}")
+            if motion_fields:
+                parts.append(f"📟 MOTION: {', '.join(motion_fields)}")
 
         # Emergency flag
         if emergency:
@@ -408,7 +466,8 @@ class ContextConfig:
     vision_history_lookback_seconds: int = 10
 
     # Maximum number of scene snapshots to keep in memory
-    max_scene_history: int = 60  # 60 seconds @ 1 FPS
+    # Updated for 10 FPS: 600 frames = 60 seconds
+    max_scene_history: int = 600  
 
     # Object types to prioritize in spatial summaries
     priority_objects: List[str] = field(default_factory=lambda: [

@@ -17,6 +17,17 @@ export interface TextTokenEvent {
   is_first: boolean;
 }
 
+export type DeviceSensorPayload = {
+  speed_mps: number;
+  speed_avg_1s_mps: number;
+  velocity_x_mps: number;
+  velocity_z_mps: number;
+  magnetic_x_ut: number;
+  magnetic_z_ut: number;
+  steps_last_3s: number;
+  steps_since_open: number;
+};
+
 // Backend main branch sends text_response events with this format
 interface TextResponseEvent {
   text: string;
@@ -26,17 +37,36 @@ interface TextResponseEvent {
 
 export type TextTokenCallback = (event: TextTokenEvent) => void;
 
+export interface DetectedObject {
+  label: string;
+  confidence: number;
+  position: string;
+  distance: string;
+  box: [number, number, number, number]; // [x1, y1, x2, y2]
+}
+
+export interface DetectionUpdateEvent {
+  objects: DetectedObject[];
+  motion: any;
+  summary: string;
+  is_moving: boolean;
+  emergency: boolean;
+}
+
 interface UseWebSocketReturn {
   socket: Socket | null;
   status: ConnectionStatus;
   sendFrame: (base64Frame: string, userQuestion?: string, debug?: boolean) => void;
+  sendDeviceSensors: (payload: DeviceSensorPayload) => void;
   onTextToken: (callback: TextTokenCallback) => void;
+  detectionData: DetectionUpdateEvent | null;
   connect: () => void;
   disconnect: () => void;
 }
 
 export function useWebSocket(): UseWebSocketReturn {
   const [status, setStatus] = useState<ConnectionStatus>("disconnected");
+  const [detectionData, setDetectionData] = useState<DetectionUpdateEvent | null>(null);
   const socketRef = useRef<Socket | null>(null);
   const textTokenCallbackRef = useRef<TextTokenCallback | null>(null);
 
@@ -62,6 +92,10 @@ export function useWebSocket(): UseWebSocketReturn {
 
     socket.on("connection_established", (data: unknown) => {
       console.log("Connection established:", data);
+    });
+
+    socket.on("detection_update", (data: DetectionUpdateEvent) => {
+      setDetectionData(data);
     });
 
     socket.on("disconnect", (reason: string) => {
@@ -152,6 +186,12 @@ export function useWebSocket(): UseWebSocketReturn {
     }
   }, []);
 
+  const sendDeviceSensors = useCallback((payload: DeviceSensorPayload) => {
+    if (socketRef.current?.connected) {
+      socketRef.current.emit("device_sensor_stream", payload);
+    }
+  }, []);
+
   const onTextToken = useCallback((callback: TextTokenCallback) => {
     textTokenCallbackRef.current = callback;
   }, []);
@@ -166,7 +206,9 @@ export function useWebSocket(): UseWebSocketReturn {
     socket: socketRef.current,
     status,
     sendFrame,
+    sendDeviceSensors,
     onTextToken,
+    detectionData,
     connect,
     disconnect,
   };

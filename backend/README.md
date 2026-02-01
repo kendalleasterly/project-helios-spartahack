@@ -53,6 +53,8 @@ Gemini LLM → Audio Narration
 
    The first time you run the server, YOLO11 model weights (`yolo11n.pt`) will be automatically downloaded by ultralytics (~6MB).
 
+   **Apple Silicon (M1/M2/M3):** the server will automatically use **MPS** (Metal) if available. If you want server-side audio playback, install `sounddevice` manually (optional).
+
 ## Running the Server
 
 ```bash

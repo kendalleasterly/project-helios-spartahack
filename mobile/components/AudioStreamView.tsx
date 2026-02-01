@@ -4,7 +4,7 @@ import type {
   DeepgramStatus,
   StreamStatus,
 } from "@/components/AudioStreamViewModel";
-import type { ConnectionStatus as BackendStatus } from "@/hooks/useWebSocket";
+import type { ConnectionStatus as BackendStatus, DetectionUpdateEvent } from "@/hooks/useWebSocket";
 import CameraView from "@/components/CameraView";
 import {
   Button,
@@ -15,6 +15,7 @@ import {
   Text,
   View,
 } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 
 type StatusMeta = {
   label: string;
@@ -43,37 +44,39 @@ type AudioStreamViewProps = {
   accumulatedNote?: string;
   onFinalizeNote?: () => void;
   onCancelNote?: () => void;
+  detectionData?: DetectionUpdateEvent | null;
+  speedMps?: number;
 };
 
 const getMicStatusMeta = (status: StreamStatus): StatusMeta => {
-  switch (status) {
-    case "recording":
-      return { label: "Mic Recording", color: "#0F766E", bg: "#CCFBF1" };
-    case "stopped":
-      return { label: "Mic Stopped", color: "#0F172A", bg: "#E2E8F0" };
-    case "error":
-      return { label: "Mic Error", color: "#B91C1C", bg: "#FEE2E2" };
-    case "idle":
-    default:
-      return { label: "Mic Idle", color: "#0F172A", bg: "#E2E8F0" };
-  }
-};
+	switch (status) {
+		case "recording":
+			return { label: "Mic Recording", color: "#0F766E", bg: "#CCFBF1" }
+		case "stopped":
+			return { label: "Mic Stopped", color: "#0F172A", bg: "#E2E8F0" }
+		case "error":
+			return { label: "Mic Error", color: "#B91C1C", bg: "#FEE2E2" }
+		case "idle":
+		default:
+			return { label: "Mic Idle", color: "#0F172A", bg: "#E2E8F0" }
+	}
+}
 
 const getDeepgramStatusMeta = (status: DeepgramStatus): StatusMeta => {
-  switch (status) {
-    case "open":
-      return { label: "Deepgram Open", color: "#047857", bg: "#D1FAE5" };
-    case "connecting":
-      return { label: "Deepgram Connecting", color: "#B45309", bg: "#FEF3C7" };
-    case "closed":
-      return { label: "Deepgram Closed", color: "#334155", bg: "#E2E8F0" };
-    case "error":
-      return { label: "Deepgram Error", color: "#B91C1C", bg: "#FEE2E2" };
-    case "idle":
-    default:
-      return { label: "Deepgram Idle", color: "#334155", bg: "#E2E8F0" };
-  }
-};
+	switch (status) {
+		case "open":
+			return { label: "Deepgram Open", color: "#047857", bg: "#D1FAE5" }
+		case "connecting":
+			return { label: "Deepgram Connecting", color: "#B45309", bg: "#FEF3C7" }
+		case "closed":
+			return { label: "Deepgram Closed", color: "#334155", bg: "#E2E8F0" }
+		case "error":
+			return { label: "Deepgram Error", color: "#B91C1C", bg: "#FEE2E2" }
+		case "idle":
+		default:
+			return { label: "Deepgram Idle", color: "#334155", bg: "#E2E8F0" }
+	}
+}
 
 const getBackendStatusMeta = (status: BackendStatus): StatusMeta => {
   switch (status) {
@@ -99,6 +102,10 @@ const getTTSStatusMeta = (tts?: TTSStatus): StatusMeta => {
 };
 
 export const AudioStreamView = ({
+  onFinalizeNote,
+  onCancelNote,
+  detectionData,
+  onFrameCaptured,
   state,
   actions,
   backendStatus,
@@ -112,7 +119,10 @@ export const AudioStreamView = ({
   accumulatedNote,
   onFinalizeNote,
   onCancelNote,
+  speedMps,
+  detectionData,
 }: AudioStreamViewProps) => {
+  const insets = useSafeAreaInsets();
   const micStatusMeta = getMicStatusMeta(state.status);
   const deepgramStatusMeta = getDeepgramStatusMeta(state.deepgramStatus);
   const backendStatusMeta = getBackendStatusMeta(backendStatus);
@@ -121,6 +131,16 @@ export const AudioStreamView = ({
   const diagnosticsLabel = isDiagnosticsVisible
     ? "Hide Diagnostics"
     : "Audio Diagnostics";
+  const modalContentInsetStyle = {
+    paddingBottom: Math.max(insets.bottom, 32),
+  };
+  const overlayInsetStyle = {
+    paddingTop: insets.top + 16,
+    paddingBottom: insets.bottom + 16,
+  };
+
+  // Instantaneous speed from backend detection data
+  const instantSpeed = detectionData?.motion?.speed_mps;
 
   return (
     <SafeAreaView style={styles.screen}>
@@ -130,8 +150,95 @@ export const AudioStreamView = ({
           getPendingQuestion={getPendingQuestion}
           onFrameCaptured={onFrameCaptured}
         />
+
+        {/* Detection Overlay */}
+        <View style={StyleSheet.absoluteFill} pointerEvents="none">
+          {/* Path Detection Oval (matches server logic) */}
+          {/* We use a square + scaleY transform to get a true mathematical ellipse */}
+          {/* matching the backend's (x^2/a^2 + y^2/b^2 <= 1) logic */}
+          <View style={{
+            position: 'absolute',
+            left: '22%',
+            width: '56%',
+            aspectRatio: 1, // Start as a circle
+            top: '70%',
+            borderWidth: 2,
+            borderColor: 'rgba(255, 255, 0, 0.4)', 
+            backgroundColor: 'rgba(255, 255, 0, 0.05)',
+            borderRadius: 9999, // Perfect circle
+            transform: [
+              { translateY: 0 }, 
+              { scaleY: 2.14 } // Stretch from 56% height to 120% height (120/56 = 2.14)
+            ],
+          }} />
+          
+          {/* Excluded Bottom Region (10%) */}
+          <View style={{
+            position: 'absolute',
+            left: 0,
+            right: 0,
+            bottom: 0,
+            height: '10%',
+            backgroundColor: 'rgba(0, 0, 0, 0.3)',
+            borderTopWidth: 1,
+            borderTopColor: 'rgba(255, 0, 0, 0.3)',
+          }}>
+            <Text style={{ 
+              color: 'rgba(255,255,255,0.5)', 
+              fontSize: 10, 
+              textAlign: 'center', 
+              marginTop: 4 
+            }}>
+              Blind Spot (Too Close)
+            </Text>
+          </View>
+
+          {/* Bounding Boxes */}
+          {detectionData?.objects?.map((obj, i) => {
+            // YOLO coordinates are relative to 720x1280 frame
+            // We need to scale them to the view percentages
+            const [x1, y1, x2, y2] = obj.box;
+            const left = (x1 / 720) * 100;
+            const top = (y1 / 1280) * 100;
+            const width = ((x2 - x1) / 720) * 100;
+            const height = ((y2 - y1) / 1280) * 100;
+            
+            // Check hazards based on position (now 'path' vs 'peripheral')
+            const isPath = obj.position === 'path';
+            const isClose = obj.distance.includes('immediate') || obj.distance.includes('close');
+            const isHazard = isPath && isClose;
+            
+            const borderColor = isHazard ? 'red' : 'rgba(0, 255, 0, 0.6)';
+
+            return (
+              <View
+                key={i}
+                style={{
+                  position: 'absolute',
+                  left: `${left}%`,
+                  top: `${top}%`,
+                  width: `${width}%`,
+                  height: `${height}%`,
+                  borderWidth: 2,
+                  borderColor: borderColor,
+                  zIndex: 10,
+                }}
+              >
+                <Text style={{ 
+                  color: 'white', 
+                  backgroundColor: borderColor, 
+                  fontSize: 10, 
+                  alignSelf: 'flex-start',
+                  paddingHorizontal: 4
+                }}>
+                  {obj.label} ({obj.distance.split(' ')[0]})
+                </Text>
+              </View>
+            );
+          })}
+        </View>
       </View>
-      <View style={styles.overlay} pointerEvents="box-none">
+      <View style={[styles.overlay, overlayInsetStyle]} pointerEvents="box-none">
         <View style={styles.statusRow}>
           <View style={[styles.pill, { backgroundColor: micStatusMeta.bg }]}>
             <View
@@ -177,11 +284,23 @@ export const AudioStreamView = ({
               {deepgramStatusMeta.label}
             </Text>
           </View>
+
+          {/* Note recording status (from face-detection) */}
           {waitingForNote && (
             <View style={[styles.pill, { backgroundColor: "#FEF3C7" }]}>
               <View style={[styles.statusDot, { backgroundColor: "#D97706" }]} />
               <Text style={[styles.pillText, { color: "#D97706" }]}>
                 Note for {waitingForNote}...
+              </Text>
+            </View>
+          )}
+
+          {/* Speed Display (from navigation) */}
+          {(typeof speedMps === "number") && (
+            <View style={[styles.pill, { backgroundColor: "#DBEAFE" }]}>
+              <View style={[styles.statusDot, { backgroundColor: "#1D4ED8" }]} />
+              <Text style={[styles.pillText, { color: "#1D4ED8" }]}>
+                Speed: {speedMps.toFixed(2)} m/s
               </Text>
             </View>
           )}
@@ -226,115 +345,241 @@ export const AudioStreamView = ({
         </View>
       </View>
 
-      <Modal
-        animationType="slide"
-        transparent
-        visible={isDiagnosticsVisible}
-        onRequestClose={onToggleDiagnostics}
-      >
-        <View style={styles.modalBackdrop}>
-          <View style={styles.modalSheet}>
-            <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>Audio Diagnostics</Text>
-              <Button title="Close" onPress={onToggleDiagnostics} />
-            </View>
-            <ScrollView
-              contentContainerStyle={styles.modalContent}
-              alwaysBounceVertical={false}
-            >
-              <View style={styles.card}>
-                <Text style={styles.cardTitle}>Transcription</Text>
-                <Text style={styles.label}>Partial</Text>
-                <Text style={styles.transcriptText}>
-                  {state.partialTranscript
-                    ? state.partialTranscript
-                    : "Listening for speech..."}
-                </Text>
-                <Text style={styles.label}>Final</Text>
-                {state.finalTranscripts.length > 0 ? (
-                  state.finalTranscripts.map((line, index) => (
-                    <Text key={`${line}-${index}`} style={styles.transcriptLine}>
-                      • {line}
-                    </Text>
-                  ))
-                ) : (
-                  <Text style={styles.emptyText}>No final transcripts yet.</Text>
-                )}
-                {state.deepgramError ? (
-                  <Text style={styles.errorText}>{state.deepgramError}</Text>
-                ) : (
-                  <Text style={styles.helper}>
-                    Model: nova-3 · Language: English · Interim results enabled
-                  </Text>
-                )}
-              </View>
+			<Modal
+				animationType="slide"
+				transparent
+				visible={isDiagnosticsVisible}
+				onRequestClose={onToggleDiagnostics}
+			>
+				<View style={styles.modalBackdrop}>
+					<View style={styles.modalSheet}>
+						<View style={styles.modalHeader}>
+							<Text style={styles.modalTitle}>Audio Diagnostics</Text>
+							<Button title="Close" onPress={onToggleDiagnostics} />
+						</View>
+						<ScrollView
+							contentContainerStyle={[
+								styles.modalContent,
+								modalContentInsetStyle,
+							]}
+							alwaysBounceVertical={false}
+						>
+							<View style={styles.card}>
+								<Text style={styles.cardTitle}>Transcription</Text>
+								<Text style={styles.label}>Partial</Text>
+								<Text style={styles.transcriptText}>
+									{state.partialTranscript
+										? state.partialTranscript
+										: "Listening for speech..."}
+								</Text>
+								<Text style={styles.label}>Final</Text>
+								{state.finalTranscripts.length > 0 ? (
+									state.finalTranscripts.map((line, index) => (
+										<Text
+											key={`${line}-${index}`}
+											style={styles.transcriptLine}
+										>
+											• {line}
+										</Text>
+									))
+								) : (
+									<Text style={styles.emptyText}>
+										No final transcripts yet.
+									</Text>
+								)}
+								{state.deepgramError ? (
+									<Text style={styles.errorText}>{state.deepgramError}</Text>
+								) : (
+									<Text style={styles.helper}>
+										Model: nova-3 · Language: English · Interim results enabled
+									</Text>
+								)}
+							</View>
 
-              <View style={styles.card}>
-                <Text style={styles.cardTitle}>Diagnostics</Text>
-                <Text style={styles.helper}>
-                  Permission: {state.permissionStatus}
-                </Text>
-                <Text style={styles.helper}>
-                  Listener status:{" "}
-                  {state.status === "recording" ? "active" : "inactive"}
-                </Text>
-                <Text style={styles.helper}>
-                  Mic error: {state.micError ?? "None"}
-                </Text>
-                <Text style={styles.helper}>
-                  Deepgram status: {state.deepgramStatus}
-                </Text>
-                <Text style={styles.helper}>
-                  Deepgram sample rate:{" "}
-                  {state.deepgramSampleRate
-                    ? `${state.deepgramSampleRate} Hz`
-                    : "Unknown"}
-                </Text>
-                <Text style={styles.helper}>
-                  Frame sample rate:{" "}
-                  {frameSampleRate ? `${frameSampleRate} Hz` : "Unknown"}
-                </Text>
-                <Text style={styles.helper}>
-                  Deepgram auth: {state.deepgramAuthMode}
-                </Text>
-                <Text style={styles.helper}>
-                  Deepgram error: {state.deepgramError ?? "None"}
-                </Text>
-              </View>
-            </ScrollView>
-          </View>
-        </View>
-      </Modal>
-    </SafeAreaView>
-  );
-};
+							<View style={styles.card}>
+								<Text style={styles.cardTitle}>Diagnostics</Text>
+								<Text style={styles.helper}>
+									Permission: {state.permissionStatus}
+								</Text>
+								<Text style={styles.helper}>
+									Listener status:{" "}
+									{state.status === "recording" ? "active" : "inactive"}
+								</Text>
+								<Text style={styles.helper}>
+									Mic error: {state.micError ?? "None"}
+								</Text>
+								<Text style={styles.helper}>
+									Deepgram status: {state.deepgramStatus}
+								</Text>
+								<Text style={styles.helper}>
+									Deepgram sample rate:{" "}
+									{state.deepgramSampleRate
+										? `${state.deepgramSampleRate} Hz`
+										: "Unknown"}
+								</Text>
+								<Text style={styles.helper}>
+									Frame sample rate:{" "}
+									{frameSampleRate ? `${frameSampleRate} Hz` : "Unknown"}
+								</Text>
+								<Text style={styles.helper}>
+									Deepgram auth: {state.deepgramAuthMode}
+								</Text>
+								<Text style={styles.helper}>
+									Deepgram error: {state.deepgramError ?? "None"}
+								</Text>
+							</View>
+						</ScrollView>
+					</View>
+				</View>
+			</Modal>
+		</SafeAreaView>
+	)
+}
 
 const styles = StyleSheet.create({
-  screen: {
+	screen: {
+		flex: 1,
+		backgroundColor: "#000000",
+	},
+	cameraLayer: {
+		flex: 1,
+	},
+	overlay: {
+		...StyleSheet.absoluteFillObject,
+		padding: 16,
+		justifyContent: "space-between",
+	},
+	statusRow: {
+		flexDirection: "row",
+		flexWrap: "wrap",
+		alignItems: "center",
+		gap: 8,
+	},
+	pill: {
+		flexDirection: "row",
+		alignItems: "center",
+		gap: 8,
+		paddingHorizontal: 12,
+		paddingVertical: 6,
+		borderRadius: 999,
+	},
+	pillText: {
+		fontSize: 12,
+		fontWeight: "700",
+	},
+	statusDot: {
+		width: 8,
+		height: 8,
+		borderRadius: 999,
+	},
+	controlPanel: {
+		backgroundColor: "rgba(15, 23, 42, 0.7)",
+		borderRadius: 16,
+		padding: 12,
+		gap: 10,
+	},
+	controls: {
+		flexDirection: "row",
+		gap: 10,
+	},
+	buttonWrap: {
+		flex: 1,
+	},
+	buttonRow: {
+		alignSelf: "stretch",
+	},
+	modalBackdrop: {
+		flex: 1,
+		justifyContent: "flex-end",
+		backgroundColor: "rgba(15, 23, 42, 0.35)",
+	},
+	modalSheet: {
+		maxHeight: "85%",
+		backgroundColor: "#F8FAFC",
+		borderTopLeftRadius: 24,
+		borderTopRightRadius: 24,
+		borderWidth: 1,
+		borderColor: "#E2E8F0",
+		overflow: "hidden",
+	},
+	modalHeader: {
+		paddingHorizontal: 16,
+		paddingVertical: 12,
+		borderBottomWidth: 1,
+		borderBottomColor: "#E2E8F0",
+		flexDirection: "row",
+		alignItems: "center",
+		justifyContent: "space-between",
+	},
+	modalTitle: {
+		fontSize: 18,
+		fontWeight: "700",
+		color: "#0F172A",
+	},
+	modalContent: {
+		padding: 16,
+		gap: 16,
+		paddingBottom: 32,
+	},
+	card: {
+		backgroundColor: "#FFFFFF",
+		borderRadius: 16,
+		padding: 16,
+		gap: 12,
+		shadowColor: "#0F172A",
+		shadowOpacity: 0.08,
+		shadowRadius: 12,
+		shadowOffset: { width: 0, height: 6 },
+		elevation: 3,
+	},
+	cardTitle: {
+		fontSize: 16,
+		fontWeight: "700",
+		color: "#0F172A",
+	},
+	label: {
+		fontSize: 12,
+		color: "#64748B",
+	},
+	transcriptText: {
+		fontSize: 15,
+		fontWeight: "600",
+		color: "#0F172A",
+	},
+	transcriptLine: {
+		fontSize: 14,
+		color: "#0F172A",
+	},
+	emptyText: {
+		fontSize: 14,
+		color: "#94A3B8",
+	},
+	errorText: {
+		fontSize: 12,
+		fontWeight: "600",
+		color: "#B91C1C",
+	},
+	helper: {
+		fontSize: 12,
+		color: "#64748B",
+	},
+  noteButtonWrap: {
     flex: 1,
-    backgroundColor: "#000000",
   },
-  cameraLayer: {
-    flex: 1,
-  },
-  overlay: {
+  gridContainer: {
     ...StyleSheet.absoluteFillObject,
-    padding: 16,
-    justifyContent: "space-between",
+    flexDirection: 'row',
+    justifyContent: 'space-evenly',
   },
-  statusRow: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    alignItems: "center",
-    gap: 8,
+  gridLineVertical: {
+    width: 1,
+    height: '100%',
+    backgroundColor: 'rgba(255, 255, 255, 0.2)',
   },
-  pill: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 8,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    borderRadius: 999,
+  gridLineHorizontal: {
+    height: 1,
+    width: '100%',
+    backgroundColor: 'rgba(255, 255, 255, 0.2)',
   },
   pillText: {
     fontSize: 12,

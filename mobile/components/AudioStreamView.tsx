@@ -7,7 +7,7 @@ import type {
 import CameraView from "@/components/CameraView"
 import type { ConnectionStatus as BackendStatus } from "@/hooks/useWebSocket"
 import { Button, Modal, ScrollView, StyleSheet, Text, View } from "react-native"
-import { useSafeAreaInsets } from "react-native-safe-area-context"
+import { SafeAreaView, useSafeAreaInsets } from "react-native-safe-area-context"
 
 type StatusMeta = {
   label: string;
@@ -96,6 +96,7 @@ export const AudioStreamView = ({
   ttsStatus,
   getPendingQuestion,
 }: AudioStreamViewProps) => {
+  const insets = useSafeAreaInsets();
   const micStatusMeta = getMicStatusMeta(state.status);
   const deepgramStatusMeta = getDeepgramStatusMeta(state.deepgramStatus);
   const backendStatusMeta = getBackendStatusMeta(backendStatus);
@@ -104,6 +105,9 @@ export const AudioStreamView = ({
   const diagnosticsLabel = isDiagnosticsVisible
     ? "Hide Diagnostics"
     : "Audio Diagnostics";
+  const modalContentInsetStyle = {
+    paddingBottom: Math.max(insets.bottom, 32),
+  };
 
   return (
     <SafeAreaView style={styles.screen}>
@@ -260,7 +264,7 @@ export const AudioStreamView = ({
 					</View>
 				</View>
 			</Modal>
-		</View>
+		</SafeAreaView>
 	)
 }
 

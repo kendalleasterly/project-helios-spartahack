@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import { io, Socket } from "socket.io-client";
 import { BACKEND_SERVER_URL } from "@env";
 
-const SERVER_URL = BACKEND_SERVER_URL || "http://192.168.137.1:8000";
+const SERVER_URL = BACKEND_SERVER_URL || "https://impolite-sky-noncontemplatively.ngrok-free.dev";
 console.log('WebSocket connecting to:', SERVER_URL);
 
 export type ConnectionStatus =

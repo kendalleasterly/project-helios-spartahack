@@ -38,6 +38,11 @@ type AudioStreamViewProps = {
   onToggleDiagnostics: () => void;
   ttsStatus?: TTSStatus;
   getPendingQuestion?: () => string | undefined;
+  onFrameCaptured?: (base64Frame: string) => void;
+  waitingForNote?: string | null;
+  accumulatedNote?: string;
+  onFinalizeNote?: () => void;
+  onCancelNote?: () => void;
 };
 
 const getMicStatusMeta = (status: StreamStatus): StatusMeta => {
@@ -102,6 +107,11 @@ export const AudioStreamView = ({
   onToggleDiagnostics,
   ttsStatus,
   getPendingQuestion,
+  onFrameCaptured,
+  waitingForNote,
+  accumulatedNote,
+  onFinalizeNote,
+  onCancelNote,
 }: AudioStreamViewProps) => {
   const micStatusMeta = getMicStatusMeta(state.status);
   const deepgramStatusMeta = getDeepgramStatusMeta(state.deepgramStatus);
@@ -115,7 +125,11 @@ export const AudioStreamView = ({
   return (
     <SafeAreaView style={styles.screen}>
       <View style={styles.cameraLayer}>
-        <CameraView onFrame={onSendFrame} getPendingQuestion={getPendingQuestion} />
+        <CameraView 
+          onFrame={onSendFrame} 
+          getPendingQuestion={getPendingQuestion}
+          onFrameCaptured={onFrameCaptured}
+        />
       </View>
       <View style={styles.overlay} pointerEvents="box-none">
         <View style={styles.statusRow}>
@@ -163,7 +177,39 @@ export const AudioStreamView = ({
               {deepgramStatusMeta.label}
             </Text>
           </View>
+          {waitingForNote && (
+            <View style={[styles.pill, { backgroundColor: "#FEF3C7" }]}>
+              <View style={[styles.statusDot, { backgroundColor: "#D97706" }]} />
+              <Text style={[styles.pillText, { color: "#D97706" }]}>
+                Note for {waitingForNote}...
+              </Text>
+            </View>
+          )}
         </View>
+
+        {/* Note accumulation feedback panel */}
+        {waitingForNote && (
+          <View style={styles.notePanel}>
+            <Text style={styles.notePanelTitle}>
+              Recording note for {waitingForNote}
+            </Text>
+            <Text style={styles.notePanelText}>
+              {accumulatedNote || "(listening...)"}
+            </Text>
+            <View style={styles.notePanelButtons}>
+              {onFinalizeNote && accumulatedNote && (
+                <View style={styles.noteButtonWrap}>
+                  <Button title="Done" onPress={onFinalizeNote} />
+                </View>
+              )}
+              {onCancelNote && (
+                <View style={styles.noteButtonWrap}>
+                  <Button title="Cancel" onPress={onCancelNote} color="#B91C1C" />
+                </View>
+              )}
+            </View>
+          </View>
+        )}
 
         <View style={styles.controlPanel}>
           <View style={styles.controls}>
@@ -389,5 +435,29 @@ const styles = StyleSheet.create({
   helper: {
     fontSize: 12,
     color: "#64748B",
+  },
+  notePanel: {
+    backgroundColor: "rgba(251, 191, 36, 0.9)",
+    borderRadius: 16,
+    padding: 16,
+    gap: 8,
+  },
+  notePanelTitle: {
+    fontSize: 14,
+    fontWeight: "700",
+    color: "#78350F",
+  },
+  notePanelText: {
+    fontSize: 16,
+    color: "#451A03",
+    fontStyle: "italic",
+  },
+  notePanelButtons: {
+    flexDirection: "row",
+    gap: 10,
+    marginTop: 8,
+  },
+  noteButtonWrap: {
+    flex: 1,
   },
 });

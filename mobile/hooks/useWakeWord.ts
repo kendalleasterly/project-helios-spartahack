@@ -51,39 +51,56 @@ function extractQuestionFromText(text: string): string | undefined {
 
 export function useWakeWord({ partialTranscript, finalTranscripts }: UseWakeWordOptions): UseWakeWordReturn {
   const pendingQuestionRef = useRef<string | undefined>(undefined);
-  const processedTranscriptsRef = useRef<Set<string>>(new Set());
+  // Track the last processed transcript content to handle array trimming correctly.
+  // When the array is trimmed via slice(), indices shift but we can find our place
+  // by looking for the last transcript we processed.
+  const lastProcessedTranscriptRef = useRef<string | null>(null);
 
   // Check final transcripts for wake word
   useEffect(() => {
-    console.log(`[WakeWord] finalTranscripts changed, count: ${finalTranscripts.length}`);
-    for (const transcript of finalTranscripts) {
-      // Skip already processed transcripts
-      if (processedTranscriptsRef.current.has(transcript)) {
-        console.log(`[WakeWord] Skipping already processed: "${transcript}"`);
-        continue;
-      }
-      console.log(`[WakeWord] Processing new transcript: "${transcript}"`);
-      processedTranscriptsRef.current.add(transcript);
+    if (finalTranscripts.length === 0) {
+      lastProcessedTranscriptRef.current = null;
+      return;
+    }
 
-      const question = extractQuestionFromText(transcript);
-      if (question) {
-        console.log(`[WakeWord] Detected question: "${question}"`);
-        pendingQuestionRef.current = question;
-      } else {
-        console.log(`[WakeWord] No wake word in transcript: "${transcript}"`);
+    // Find where to start processing
+    let startIndex = 0;
+    if (lastProcessedTranscriptRef.current !== null) {
+      // Find the last processed transcript in the current array
+      const lastProcessedIndex = finalTranscripts.lastIndexOf(lastProcessedTranscriptRef.current);
+      if (lastProcessedIndex !== -1) {
+        // Start after the last processed transcript
+        startIndex = lastProcessedIndex + 1;
       }
+      // If not found, the array was likely cleared or trimmed past our marker - process all
+    }
+
+    // Process new transcripts
+    for (let i = startIndex; i < finalTranscripts.length; i++) {
+      const transcript = finalTranscripts[i];
+      
+      const hasWakeWord = transcript.toLowerCase().includes(WAKE_WORD);
+      if (hasWakeWord) {
+        console.log(`[WakeWord] Found "helios" in transcript: "${transcript}"`);
+        
+        const question = extractQuestionFromText(transcript);
+        if (question) {
+          console.log(`[WakeWord] Extracted question: "${question}"`);
+          pendingQuestionRef.current = question;
+        }
+      }
+    }
+    
+    // Remember the last transcript we processed
+    if (finalTranscripts.length > 0) {
+      lastProcessedTranscriptRef.current = finalTranscripts[finalTranscripts.length - 1];
     }
   }, [finalTranscripts]);
 
-  // Also check partial transcript for early detection
+  // Also check partial transcript for early detection (silent, no logging)
   useEffect(() => {
     if (!partialTranscript) return;
-
-    const question = extractQuestionFromText(partialTranscript);
-    if (question && question.length > 3) {
-      // Only log for debugging, don't set pending yet (wait for final)
-      console.log(`[WakeWord] Partial detection: "${question}"`);
-    }
+    // Early detection is just for potential future use, no action needed
   }, [partialTranscript]);
 
   const consumePendingQuestion = useCallback((): string | undefined => {

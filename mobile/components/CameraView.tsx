@@ -8,7 +8,8 @@ import {
 import { manipulateAsync, SaveFormat } from "expo-image-manipulator";
 
 const FRAME_RATE = 1;
-const TARGET_WIDTH = 1280; // 720p width
+const TARGET_WIDTH = 720;  // 720p for portrait mode (720x1280 after rotation)
+const TARGET_HEIGHT = 1280;
 
 type CameraViewProps = {
   onFrame: (base64Frame: string, debug?: boolean) => void;
@@ -29,10 +30,11 @@ export default function CameraView({ onFrame }: CameraViewProps) {
         enableShutterSound: false,
       });
 
-      // Downscale to 720p (1280px width)
+      // Downscale to 720p (720x1280 for portrait after EXIF rotation)
+      // manipulateAsync auto-rotates based on EXIF, so resize to final display size
       const resized = await manipulateAsync(
         photo.path,
-        [{ resize: { width: TARGET_WIDTH } }],
+        [{ resize: { width: TARGET_WIDTH, height: TARGET_HEIGHT } }],
         { compress: 0.8, format: SaveFormat.JPEG }
       );
 

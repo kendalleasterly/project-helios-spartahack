@@ -52,14 +52,20 @@ class FaceService:
     - GPU-accelerated inference (~200-300ms)
     """
 
-    def __init__(self, db_path: str = "./person_memory/faces.db"):
+    def __init__(self, db_path: Optional[str] = None):
         """
         Initialize the face service.
 
         Args:
-            db_path: Path to SQLite database for storing face encodings
+            db_path: Path to SQLite database. If None, uses default path relative to this file.
         """
-        self.db_path = db_path
+        if db_path is None:
+            # Resolve to backend/person_memory/faces.db regardless of CWD
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            self.db_path = os.path.join(base_dir, "person_memory", "faces.db")
+        else:
+            self.db_path = db_path
+
         self.model_name = "ArcFace"  # Best accuracy model (512D embeddings)
         self.detector_backend = "opencv"  # Fast and reliable
         self.distance_metric = "cosine"
@@ -67,7 +73,8 @@ class FaceService:
         # ArcFace default threshold for cosine distance
         # Lower distance = more similar faces
         # Match if distance < threshold
-        self.recognition_threshold = 0.68
+        # Adjusted to 0.40 (0.6 similarity) to prevent false positives
+        self.recognition_threshold = 0.40
 
         # In-memory cache of known faces for fast lookup
         self.known_faces_cache: Dict[str, Person] = {}
@@ -130,6 +137,33 @@ class FaceService:
 
         conn.close()
         logger.info(f"Loaded {len(self.known_faces_cache)} people from database")
+
+    def preload_models(self):
+        """
+        Preload DeepFace models at startup to avoid runtime delays.
+        """
+        try:
+            logger.info(f"🔄 Preloading Face Recognition model ({self.model_name})...")
+            
+            # Create a dummy black image to trigger model loading
+            dummy_img = np.zeros((100, 100, 3), dtype=np.uint8)
+            
+            # Run a dummy representation to force model download/load
+            # We wrap this in try/except because DeepFace might complain about no face
+            try:
+                DeepFace.represent(
+                    img_path=dummy_img,
+                    model_name=self.model_name,
+                    enforce_detection=False
+                )
+            except Exception:
+                # Expected to fail or warn, but the model should be loaded
+                pass
+                
+            logger.info("✅ Face Recognition model preloaded successfully")
+            
+        except Exception as e:
+            logger.warning(f"⚠️  Face model preload failed (will load on first use): {e}")
 
     def detect_and_recognize(self, image: np.ndarray) -> List[FaceDetection]:
         """
@@ -254,7 +288,7 @@ class FaceService:
 
         # Check if best match is below threshold
         if best_distance < self.recognition_threshold:
-            logger.debug(f"Match found: {best_match_name} (distance: {best_distance:.3f} < threshold: {self.recognition_threshold})")
+            logger.info(f"Match found: {best_match_name} (distance: {best_distance:.3f} < threshold: {self.recognition_threshold})")
             return best_match_id, best_match_name, best_distance
         else:
             logger.debug(f"No match (best distance: {best_distance:.3f} >= threshold: {self.recognition_threshold})")

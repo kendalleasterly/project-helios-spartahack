@@ -14,6 +14,8 @@ from chromadb.config import Settings
 logger = logging.getLogger(__name__)
 
 
+import os
+
 class NoteService:
     """
     Note storage and retrieval service using ChromaDB.
@@ -25,14 +27,19 @@ class NoteService:
     - Support for semantic similarity search (future enhancement)
     """
 
-    def __init__(self, db_path: str = "./person_memory/chroma_db"):
+    def __init__(self, db_path: Optional[str] = None):
         """
         Initialize the note service.
 
         Args:
-            db_path: Path to ChromaDB persistent storage directory
+            db_path: Path to ChromaDB persistent storage directory. If None, uses default relative to this file.
         """
-        self.db_path = db_path
+        if db_path is None:
+            # Resolve to backend/person_memory/chroma_db regardless of CWD
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            self.db_path = os.path.join(base_dir, "person_memory", "chroma_db")
+        else:
+            self.db_path = db_path
 
         # Initialize ChromaDB with persistent storage
         self.client = chromadb.PersistentClient(

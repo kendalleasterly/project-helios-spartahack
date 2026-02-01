@@ -433,6 +433,44 @@ def detect_person_command(text: str) -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
+def detect_system_command(text: str) -> Optional[str]:
+    """
+    Detect system control commands in user speech.
+
+    Returns:
+        command_type: 'enable_warnings', 'disable_warnings', or None
+    """
+    if not text:
+        return None
+
+    text_lower = text.lower().strip()
+
+    # Disable warning patterns
+    disable_patterns = [
+        r'(?:helios,?\s+)?(?:turn off|stop|disable|mute)\s+(?:obstacle\s+)?(?:detection|warnings|alerts)',
+        r'(?:helios,?\s+)?(?:stop|quit|end)\s+(?:warning|alerting)(?: me)?',
+        r'(?:helios,?\s+)?(?:be|stay)\s+(?:quiet|silent)',
+        r'(?:helios,?\s+)?(?:i am|im)\s+(?:safe|good|ok)',
+    ]
+
+    for pattern in disable_patterns:
+        if re.search(pattern, text_lower):
+            return 'disable_warnings'
+
+    # Enable warning patterns
+    enable_patterns = [
+        r'(?:helios,?\s+)?(?:turn on|start|enable|resume)\s+(?:obstacle\s+)?(?:detection|warnings|alerts)',
+        r'(?:helios,?\s+)?(?:start|resume)\s+(?:warning|alerting)(?: me)?',
+        r'(?:helios,?\s+)?(?:watch|look)\s+out(?: for me)?',
+    ]
+
+    for pattern in enable_patterns:
+        if re.search(pattern, text_lower):
+            return 'enable_warnings'
+
+    return None
+
+
 # ============================================================================
 # WEBSOCKET EVENT HANDLERS
 # ============================================================================
@@ -530,6 +568,28 @@ async def video_frame_streaming(sid, data):
                     'message': f'Ready to save {person_name}'
                 }, room=sid)
                 return
+
+            # Check for system commands (warnings on/off)
+            system_command = detect_system_command(user_question)
+            if system_command:
+                if system_command == 'disable_warnings':
+                    logger.info("🔇 Disabling proactive warnings")
+                    assistant.set_proactive_warnings(False)
+                    await sio.emit('text_response', {
+                        'text': "Okay, I'll stop the obstacle warnings.",
+                        'mode': 'system',
+                        'emergency': False
+                    }, room=sid)
+                    return
+                elif system_command == 'enable_warnings':
+                    logger.info("🔊 Enabling proactive warnings")
+                    assistant.set_proactive_warnings(True)
+                    await sio.emit('text_response', {
+                        'text': "Okay, obstacle warnings are back on.",
+                        'mode': 'system',
+                        'emergency': False
+                    }, room=sid)
+                    return
 
             # Regular question processing
             try:

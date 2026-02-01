@@ -552,9 +552,20 @@ class BlindAssistantService:
         # Track announced people (to avoid spam - announce once per session)
         self._announced_people: set = set()  # Set of person_ids we've announced
 
+        # Toggle for proactive obstacle warnings
+        self.proactive_warnings_enabled: bool = True
+
         # Heuristics state tracking for collision detection
         self.last_spoke_time: float = 0.0  # Timestamp of last speech output
         self.heuristics_config = HeuristicsConfig()
+
+    def set_proactive_warnings(self, enabled: bool):
+        """Enable or disable proactive obstacle warnings."""
+        self.proactive_warnings_enabled = enabled
+        status = "enabled" if enabled else "disabled"
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"🛡️ Proactive warnings {status}")
 
     async def process_frame(
         self,
@@ -719,6 +730,11 @@ class BlindAssistantService:
             frame_base64=frame_base64 if self.config.store_frames else None
         )
         self.scene_history.append(snapshot)
+
+        # CHECK PROACTIVE WARNINGS FLAG
+        if not self.proactive_warnings_enabled:
+            logger.debug(f"🔇 Proactive warnings DISABLED - suppressing alert: {decision.reason}")
+            return None
 
         # If heuristics say don't speak, stay silent
         if not decision.should_speak:

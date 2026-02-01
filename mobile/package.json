@@ -1,9 +1,9 @@
 {
   "name": "a-eye",
-  "main": "expo-router/entry",
+  "main": "app/index.tsx",
   "version": "1.0.0",
   "scripts": {
-    "start": "npm run metro:clean && expo start --tunnel",
+    "start": "expo start --tunnel",
     "reset-project": "node ./scripts/reset-project.js",
     "android": "expo run:android",
     "ios": "expo run:ios",
@@ -30,6 +30,7 @@
     "expo-linking": "~8.0.11",
     "expo-location": "~19.0.8",
     "expo-router": "~6.0.22",
+    "expo-sensors": "~15.0.8",
     "expo-splash-screen": "~31.0.13",
     "expo-status-bar": "~3.0.9",
     "expo-stream-audio": "file:./expo-stream-audio",

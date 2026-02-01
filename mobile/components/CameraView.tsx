@@ -5,8 +5,10 @@ import {
   useCameraDevice,
   useCameraPermission,
 } from "react-native-vision-camera";
+import { manipulateAsync, SaveFormat } from "expo-image-manipulator";
 
 const FRAME_RATE = 1;
+const TARGET_WIDTH = 1280; // 720p width
 
 type CameraViewProps = {
   onFrame: (base64Frame: string, debug?: boolean) => void;
@@ -27,7 +29,14 @@ export default function CameraView({ onFrame }: CameraViewProps) {
         enableShutterSound: false,
       });
 
-      const response = await fetch(`file://${photo.path}`);
+      // Downscale to 720p (1280px width)
+      const resized = await manipulateAsync(
+        photo.path,
+        [{ resize: { width: TARGET_WIDTH } }],
+        { compress: 0.8, format: SaveFormat.JPEG }
+      );
+
+      const response = await fetch(resized.uri);
       const blob = await response.blob();
       const reader = new FileReader();
 
@@ -35,7 +44,7 @@ export default function CameraView({ onFrame }: CameraViewProps) {
         const base64 = reader.result as string;
         const base64Data = base64.split(",")[1];
         console.log(
-          `Frame captured: ${photo.width}x${photo.height}, base64 JPEG length: ${base64Data.length}`,
+          `Frame captured: ${photo.width}x${photo.height} → ${resized.width}x${resized.height}, base64 length: ${base64Data.length}`,
         );
 
         onFrame(base64Data);

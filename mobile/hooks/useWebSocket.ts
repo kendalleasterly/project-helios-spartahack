@@ -17,6 +17,13 @@ export interface TextTokenEvent {
   is_first: boolean;
 }
 
+// Backend main branch sends text_response events with this format
+interface TextResponseEvent {
+  text: string;
+  mode: "vision" | "conversation";
+  emergency: boolean;
+}
+
 export type TextTokenCallback = (event: TextTokenEvent) => void;
 
 interface UseWebSocketReturn {
@@ -75,9 +82,45 @@ export function useWebSocket(): UseWebSocketReturn {
       setStatus("connecting");
     });
 
+    // Listen for streaming text_token events (feature/audio-tts branch backend)
     socket.on("text_token", (data: TextTokenEvent) => {
+      console.log('[WebSocket] text_token received:', JSON.stringify(data));
       if (textTokenCallbackRef.current) {
         textTokenCallbackRef.current(data);
+      } else {
+        console.warn('[WebSocket] text_token received but no callback registered');
+      }
+    });
+
+    // Listen for complete text_response events (main branch backend)
+    // Convert to TextTokenEvent format for TTS pipeline compatibility
+    socket.on("text_response", (data: TextResponseEvent) => {
+      console.log('[WebSocket] text_response received:', JSON.stringify(data));
+      if (textTokenCallbackRef.current && data.text) {
+        // Send the complete text as a single token with sentence terminator
+        // This ensures the text buffer will flush and trigger TTS
+        const textWithPunctuation = data.text.endsWith('.') || 
+                                    data.text.endsWith('!') || 
+                                    data.text.endsWith('?') 
+          ? data.text 
+          : data.text + '.';
+        
+        textTokenCallbackRef.current({
+          token: textWithPunctuation,
+          emergency: data.emergency,
+          is_first: true,
+        });
+        console.log('[WebSocket] Converted text_response to text_token for TTS');
+      } else if (!textTokenCallbackRef.current) {
+        console.warn('[WebSocket] text_response received but no callback registered');
+      }
+    });
+
+    // Log all events for debugging - helps identify what backend is sending
+    socket.onAny((eventName: string, ...args: unknown[]) => {
+      if (eventName !== 'text_token' && eventName !== 'text_response' && 
+          eventName !== 'connect' && eventName !== 'disconnect') {
+        console.log(`[WebSocket] Event "${eventName}":`, JSON.stringify(args).slice(0, 200));
       }
     });
 

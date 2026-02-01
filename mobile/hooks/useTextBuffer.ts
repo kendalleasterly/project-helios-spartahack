@@ -22,19 +22,24 @@ export function useTextBuffer() {
   const callbackRef = useRef<SentenceCallback | null>(null);
 
   const addToken = useCallback((token: string, emergency: boolean) => {
+    console.log(`[TextBuffer] addToken called: "${token}" (emergency: ${emergency})`);
     bufferRef.current += token;
     emergencyRef.current = emergencyRef.current || emergency;
 
     const hasSentenceTerminator = SENTENCE_TERMINATORS.test(token);
+    console.log(`[TextBuffer] Buffer now: "${bufferRef.current}" | Has terminator: ${hasSentenceTerminator}`);
 
     if (hasSentenceTerminator) {
       const sentence = bufferRef.current.trim();
 
       if (sentence && callbackRef.current) {
+        console.log(`[TextBuffer] Complete sentence: "${sentence}" (emergency: ${emergencyRef.current})`);
         callbackRef.current({
           sentence,
           emergency: emergencyRef.current,
         });
+      } else if (sentence && !callbackRef.current) {
+        console.warn('[TextBuffer] Sentence ready but no callback registered!');
       }
 
       bufferRef.current = '';
@@ -43,6 +48,7 @@ export function useTextBuffer() {
   }, []);
 
   const onSentence = useCallback((callback: SentenceCallback) => {
+    console.log('[TextBuffer] onSentence callback registered');
     callbackRef.current = callback;
   }, []);
 

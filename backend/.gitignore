@@ -57,3 +57,6 @@ vertex-api-key.json
 
 # Max don't want this stuff
 *.wav
+frame-hallway-images/
+frame_hallway-output/
+tests/

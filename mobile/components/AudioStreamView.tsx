@@ -114,13 +114,9 @@ export const AudioStreamView = ({
   onToggleDiagnostics,
   ttsStatus,
   getPendingQuestion,
-  onFrameCaptured,
   waitingForNote,
   accumulatedNote,
-  onFinalizeNote,
-  onCancelNote,
   speedMps,
-  detectionData,
 }: AudioStreamViewProps) => {
   const insets = useSafeAreaInsets();
   const micStatusMeta = getMicStatusMeta(state.status);

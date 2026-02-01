@@ -192,7 +192,7 @@ class GeminiContextualNarrator:
             max_output_tokens=150
         )
 
-        response_stream = self.client.aio.models.generate_content_stream(
+        response_stream = await self.client.aio.models.generate_content_stream(
             model=self.model,
             contents=messages,
             config=config
@@ -234,6 +234,11 @@ class GeminiContextualNarrator:
 
         end_time = time.perf_counter()
 
+        # Debug logging - show raw Gemini response
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"🔍 RAW GEMINI | Full response with prefix: '{full_response}'")
+
         # Update history
         self._add_to_history("user", context_prompt)
         self._add_to_history("model", full_response)
@@ -268,6 +273,11 @@ class GeminiContextualNarrator:
         end_time = time.perf_counter()
         latency = ((first_chunk_time or end_time) - start_time) * 1000
         total = (end_time - start_time) * 1000
+
+        # Debug logging
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"🔍 GEMINI RESPONSE | Speak: {should_speak} | Text: '{full_text.strip()}' | Length: {len(full_text.strip())}")
 
         return StreamedResponse(
             should_speak=should_speak,

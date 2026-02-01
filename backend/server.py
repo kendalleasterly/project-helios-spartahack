@@ -17,7 +17,10 @@ import cv2
 import networkx as nx
 import numpy as np
 import socketio
-import sounddevice as sd
+try:
+    import sounddevice as sd
+except Exception:  # Optional dependency for server-side audio playback
+    sd = None
 import torch
 import uvicorn
 from dotenv import load_dotenv
@@ -72,6 +75,15 @@ SAVE_DEBUG_FRAMES = os.getenv('SAVE_DEBUG_FRAMES', 'true').lower() == 'true'
 DEBUG_OUTPUT_DIR = Path('server_debug_output')
 
 
+def _select_torch_device() -> str:
+    """Select the best available torch device (CUDA > MPS > CPU)."""
+    if torch.cuda.is_available():
+        return "cuda"
+    if hasattr(torch.backends, "mps") and torch.backends.mps.is_available() and torch.backends.mps.is_built():
+        return "mps"
+    return "cpu"
+
+
 def load_yolo_model():
     """
     Load YOLO11 Extra Large model at startup with GPU acceleration.
@@ -86,14 +98,15 @@ def load_yolo_model():
     logger.info("Loading YOLO11 Extra Large model (Maximum Recall Mode)...")
 
     try:
-        # Check CUDA availability
-        if not torch.cuda.is_available():
-            logger.warning("⚠️  CUDA not available! Falling back to CPU (will be slow)")
-            device = 'cpu'
-        else:
-            device = 'cuda'
+        # Select best device (CUDA > MPS > CPU)
+        device = _select_torch_device()
+        if device == "cuda":
             gpu_name = torch.cuda.get_device_name(0)
-            logger.info(f"✓ GPU Detected: {gpu_name}")
+            logger.info(f"✓ CUDA GPU Detected: {gpu_name}")
+        elif device == "mps":
+            logger.info("✓ Apple MPS detected: using Metal acceleration")
+        else:
+            logger.warning("⚠️  No GPU backend available! Falling back to CPU (will be slow)")
 
         # Load YOLO11 Extra Large model (maximum recall)
         # ultralytics will auto-download yolo11x.pt (~140MB) if not present
@@ -109,6 +122,8 @@ def load_yolo_model():
             allocated = torch.cuda.memory_allocated(0) / 1024**3
             logger.info(f"✓ GPU Memory Allocated: {allocated:.2f} GB")
             logger.info(f"✓ Max Recall Mode: conf=0.05, iou=0.6")
+        elif device == 'mps':
+            logger.info("✓ MPS backend active (Metal Performance Shaders)")
 
     except Exception as e:
         logger.error(f"✗ Failed to load YOLO11 model: {e}")
@@ -804,6 +819,10 @@ def play_audio_on_server(audio_data: bytes, sample_rate: int = 24000):
         sample_rate: Sample rate in Hz (default: 24000 for Gemini)
     """
     try:
+        if sd is None:
+            logger.warning("⚠️  sounddevice not installed; skipping server-side audio playback.")
+            return
+
         # Convert bytes to numpy array (int16 PCM format)
         audio_array = np.frombuffer(audio_data, dtype=np.int16)
 

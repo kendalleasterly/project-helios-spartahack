@@ -45,7 +45,10 @@ export function MagnetometerReadout() {
 
       Magnetometer.setUpdateInterval(50);
       subscription = Magnetometer.addListener(({ x, z }) => {
-        setMagnetometer({ x, z });
+        setMagnetometer({
+          x: Number.isFinite(x) ? x : 0,
+          z: Number.isFinite(z) ? z : 0,
+        });
       });
     };
 
@@ -59,16 +62,19 @@ export function MagnetometerReadout() {
     };
   }, []);
 
+  const safeX = Number.isFinite(magnetometer.x) ? magnetometer.x : 0;
+  const safeZ = Number.isFinite(magnetometer.z) ? magnetometer.z : 0;
+
   return (
     <View pointerEvents="none" style={styles.container}>
       <Text style={styles.title}>Magnetometer (μT)</Text>
       <View style={styles.row}>
         <Text style={styles.label}>x</Text>
-        <Text style={styles.value}>{magnetometer.x.toFixed(2)}</Text>
+        <Text style={styles.value}>{safeX.toFixed(2)}</Text>
       </View>
       <View style={styles.row}>
         <Text style={styles.label}>z</Text>
-        <Text style={styles.value}>{magnetometer.z.toFixed(2)}</Text>
+        <Text style={styles.value}>{safeZ.toFixed(2)}</Text>
       </View>
     </View>
   );

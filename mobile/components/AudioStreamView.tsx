@@ -144,7 +144,6 @@ export const AudioStreamView = ({
 						</Text>
 					</View>
 				</View>
-
 				<View style={styles.controlPanel}>
 					<View style={styles.controls}>
 						<View style={styles.buttonWrap}>
@@ -262,21 +261,13 @@ const styles = StyleSheet.create({
 	overlay: {
 		...StyleSheet.absoluteFillObject,
 		padding: 16,
-		justifyContent: "flex-start",
+		justifyContent: "space-between",
 	},
 	statusRow: {
 		flexDirection: "row",
 		flexWrap: "wrap",
 		alignItems: "center",
 		gap: 8,
-	},
-	readoutStack: {
-		flex: 1,
-		alignSelf: "stretch",
-		justifyContent: "center",
-		alignItems: "center",
-		gap: 16,
-		paddingVertical: 16,
 	},
 	pill: {
 		flexDirection: "row",

@@ -2,10 +2,6 @@
 
 Assistive navigation application for blind users using computer vision and AI.
 
-## Acknowledgments
-
-The Kokoro TTS integration in this project is adapted from [expo-kokoro-onnx](https://github.com/isaiahbjork/expo-kokoro-onnx) by Isaiah Bjork (MIT License). We are grateful for this excellent implementation of on-device text-to-speech using ONNX Runtime.
-
 ## Setup
 
 1. Install dependencies

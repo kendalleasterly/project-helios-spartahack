@@ -56,8 +56,11 @@ export function useWakeWord({ partialTranscript, finalTranscripts, onWakeWord }:
   const pendingQuestionRef = useRef<string | undefined>(undefined);
   const pendingWakeRef = useRef<boolean>(false);
   const pendingWakeTsRef = useRef<number | null>(null);
-  const processedTranscriptsRef = useRef<Set<string>>(new Set());
   const lastInterruptAtRef = useRef<number | null>(null);
+  // Track the last processed transcript content to handle array trimming correctly.
+  // When the array is trimmed via slice(), indices shift but we can find our place
+  // by looking for the last transcript we processed.
+  const lastProcessedTranscriptRef = useRef<string | null>(null);
 
   const triggerWakeInterrupt = useCallback(() => {
     const now = Date.now();
@@ -73,17 +76,28 @@ export function useWakeWord({ partialTranscript, finalTranscripts, onWakeWord }:
 
   // Check final transcripts for wake word
   useEffect(() => {
-    console.log(`[WakeWord] finalTranscripts changed, count: ${finalTranscripts.length}`);
-    for (const transcript of finalTranscripts) {
-      // Skip already processed transcripts
-      if (processedTranscriptsRef.current.has(transcript)) {
-        console.log(`[WakeWord] Skipping already processed: "${transcript}"`);
-        continue;
-      }
-      console.log(`[WakeWord] Processing new transcript: "${transcript}"`);
-      processedTranscriptsRef.current.add(transcript);
+    if (finalTranscripts.length === 0) {
+      lastProcessedTranscriptRef.current = null;
+      return;
+    }
 
+    // Find where to start processing
+    let startIndex = 0;
+    if (lastProcessedTranscriptRef.current !== null) {
+      // Find the last processed transcript in the current array
+      const lastProcessedIndex = finalTranscripts.lastIndexOf(lastProcessedTranscriptRef.current);
+      if (lastProcessedIndex !== -1) {
+        // Start after the last processed transcript
+        startIndex = lastProcessedIndex + 1;
+      }
+      // If not found, the array was likely cleared or trimmed past our marker - process all
+    }
+
+    // Process new transcripts
+    for (let i = startIndex; i < finalTranscripts.length; i++) {
+      const transcript = finalTranscripts[i];
       const now = Date.now();
+
       if (pendingWakeRef.current) {
         const wakeAge = pendingWakeTsRef.current ? now - pendingWakeTsRef.current : Infinity;
         pendingWakeRef.current = false;
@@ -115,9 +129,14 @@ export function useWakeWord({ partialTranscript, finalTranscripts, onWakeWord }:
         console.log(`[WakeWord] No wake word in transcript: "${transcript}"`);
       }
     }
+    
+    // Remember the last transcript we processed
+    if (finalTranscripts.length > 0) {
+      lastProcessedTranscriptRef.current = finalTranscripts[finalTranscripts.length - 1];
+    }
   }, [finalTranscripts, triggerWakeInterrupt]);
 
-  // Also check partial transcript for early detection
+  // Also check partial transcript for early detection (silent, no logging)
   useEffect(() => {
     if (!partialTranscript) return;
 

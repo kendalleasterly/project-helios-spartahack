@@ -9,6 +9,7 @@ import io
 import json
 import logging
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -88,7 +89,7 @@ def load_yolo_model():
     logger.info("Loading YOLO11 Small model...")
     try:
         device = _select_torch_device()
-        # Switching to yolo11s.pt for faster inference (better FPS)
+        # Load YOLO11 Small model for faster inference
         yolo_model = YOLO('yolo11s.pt')
         yolo_model.to(device)
         logger.info(f"✓ YOLO11s loaded successfully on {device.upper()}")
@@ -175,34 +176,104 @@ def calculate_distance(bbox_height: float, image_height: int, label: str = 'defa
 
 
 def annotate_frame(image: np.ndarray, objects: List[Dict[str, Any]],
-                   emergency_stop: bool = False) -> np.ndarray:
-    """Annotate image for debugging."""
+                   emergency_stop: bool = False, faces: List[Dict[str, Any]] = None) -> np.ndarray:
+    """
+    Draw bounding boxes, labels, and 3x3 grid positions on the image for debugging.
+    Includes navigation ellipse/path visualization and face detection.
+    """
     annotated = image.copy()
     h, w = image.shape[:2]
-    
-    # Draw path oval for visualization (shifted)
+
+    # Draw path oval for visualization (from navigation branch)
     cv2.ellipse(annotated, (int(w/2), int(h*1.3)), (int(w*0.28), int(h*0.6)), 0, 180, 360, (255, 255, 0), 2)
     # Draw excluded bottom region line
     cv2.line(annotated, (0, int(h*0.9)), (w, int(h*0.9)), (0, 0, 255), 2)
-    
+
     if emergency_stop:
-        cv2.rectangle(annotated, (0, 0), (image.shape[1], 50), (0, 0, 255), -1)
+        cv2.rectangle(annotated, (0, 0), (w, 50), (0, 0, 255), -1)
         cv2.putText(annotated, "EMERGENCY: VEHICLE DETECTED", (10, 35), cv2.FONT_HERSHEY_BOLD, 1.2, (255, 255, 255), 3)
-    
+
     for obj in objects:
         label = obj.get('label', 'unknown')
         confidence = obj.get('confidence', 0.0)
         position = obj.get('position', 'unknown')
         distance = obj.get('distance', 'unknown')
-        x1, y1, x2, y2 = obj.get('box', [0, 0, 0, 0])
-        dist_cat = distance.split()[0] if ' ' in distance else distance
-        
-        # Red if immediate path hazard
-        is_hazard = position == "path" and (dist_cat == 'immediate' or dist_cat == 'close')
-        color = (0, 0, 255) if is_hazard else (0, 255, 0)
-        
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(annotated, f"{label} {int(confidence*100)}%", (x1, y1-10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+        box = obj.get('box', [0, 0, 0, 0])
+        x1, y1, x2, y2 = box
+
+        # Extract distance category
+        distance_category = distance.split()[0] if distance and ' ' in distance else distance
+
+        # Color code by distance (from face-detection) with path hazard check (from navigation)
+        is_hazard = position == "path" and (distance_category in ['immediate', 'close'])
+        if is_hazard or distance_category == 'immediate':
+            color = (0, 0, 255)  # Red
+            thickness = 3
+        elif distance_category == 'close':
+            color = (0, 165, 255)  # Orange
+            thickness = 2
+        elif distance_category == 'medium':
+            color = (0, 255, 255)  # Yellow
+            thickness = 2
+        else:  # far
+            color = (0, 255, 0)  # Green
+            thickness = 2
+
+        # Override to red if it's a vehicle causing emergency
+        if label in VEHICLE_CLASSES and distance_category in EMERGENCY_DISTANCES:
+            color = (0, 0, 255)  # Red
+            thickness = 4
+
+        # Draw bounding box
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), color, thickness)
+
+        # Draw label text
+        label_text = f"{label.capitalize()} {int(confidence * 100)}%"
+        position_text = position.replace('-', ' ').title()
+        distance_text = distance.upper()
+        text_y = y1 - 10 if y1 - 10 > 20 else y1 + 20
+
+        (text_width, text_height), baseline = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+        cv2.rectangle(annotated, (x1, text_y - text_height - 5), (x1 + text_width + 10, text_y + baseline), color, -1)
+        cv2.putText(annotated, label_text, (x1 + 5, text_y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+
+        # Draw position and distance below the box
+        position_y = y2 + 20
+        cv2.rectangle(annotated, (x1, position_y - 15), (x1 + 150, position_y + 5), (0, 0, 0), -1)
+        cv2.putText(annotated, f"{position_text} | {distance_text}", (x1 + 5, position_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+    # Add object count
+    cv2.putText(annotated, f"Objects: {len(objects)}", (w - 150, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+    # Draw face detection bounding boxes (from face-detection branch)
+    if faces:
+        for face in faces:
+            bbox = face.get('bbox', {})
+            x, y, fw, fh = bbox.get('x', 0), bbox.get('y', 0), bbox.get('w', 0), bbox.get('h', 0)
+            name = face.get('name', 'unknown')
+            is_known = face.get('is_known', False)
+            face_conf = face.get('confidence', 0.0)
+            location = face.get('location', '')
+
+            # Cyan for known, Magenta for unknown
+            color = (255, 255, 0) if is_known else (255, 0, 255)
+            thickness = 3 if is_known else 2
+
+            cv2.rectangle(annotated, (x, y), (x + fw, y + fh), color, thickness)
+            label_text = f"{name.capitalize()} {int(face_conf * 100)}%"
+            text_y = y - 10 if y - 10 > 20 else y + 20
+
+            (text_width, text_height), baseline = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2)
+            cv2.rectangle(annotated, (x, text_y - text_height - 5), (x + text_width + 10, text_y + baseline), color, -1)
+            cv2.putText(annotated, label_text, (x + 5, text_y - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+            if location:
+                location_y = y + fh + 20
+                location_text = location.replace('-', ' ').title()
+                cv2.rectangle(annotated, (x, location_y - 15), (x + len(location_text) * 10, location_y + 5), (0, 0, 0), -1)
+                cv2.putText(annotated, location_text, (x + 5, location_y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+
+        cv2.putText(annotated, f"Faces: {len(faces)}", (w - 150, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
     return annotated
 
 
@@ -268,8 +339,23 @@ async def lifespan(app: FastAPI):
     global assistant
     load_yolo_model()
     try:
-        assistant = BlindAssistantService(ContextConfig(spatial_lookback_seconds=30, max_scene_history=60, store_frames=False))
-        logger.info("✓ Blind Assistant Service initialized")
+        logger.info("🤖 Initializing Blind Assistant Service...")
+        config = ContextConfig(
+            spatial_lookback_seconds=30,
+            vision_history_lookback_seconds=10,
+            max_scene_history=60,
+            store_frames=False
+        )
+        assistant = BlindAssistantService(config)
+        logger.info("✓ Blind Assistant Service initialized successfully")
+
+        # Preload person memory models
+        logger.info("🚀 Preloading person memory models...")
+        if assistant.face_service:
+            assistant.face_service.preload_models()
+        if assistant.note_service:
+            assistant.note_service.preload_models()
+        logger.info("✅ All models preloaded successfully")
     except Exception as e:
         logger.error(f"✗ Assistant initialization failed: {e}")
     yield
@@ -280,6 +366,77 @@ app = FastAPI(title="YOLO11 Vision Server", lifespan=lifespan)
 sio = socketio.AsyncServer(async_mode='asgi', cors_allowed_origins='*')
 socket_app = socketio.ASGIApp(socketio_server=sio, other_asgi_app=app)
 
+
+@app.get("/health")
+async def health():
+    """Detailed health check with model status."""
+    return {
+        "status": "healthy",
+        "model_loaded": yolo_model is not None,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+
+# ============================================================================
+# PERSON MEMORY COMMAND DETECTION
+# ============================================================================
+
+def detect_person_command(text: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Detect person memory commands in user speech.
+
+    Returns:
+        (command_type, person_name) where command_type is:
+        - 'save_person': User wants to save a person's face
+        - 'note_request': User wants to leave a note (needs to wait for note content)
+        - None: Not a person command
+
+    Examples:
+        - "remember this person as John" -> ('save_person', 'John')
+        - "save this person as Sarah" -> ('save_person', 'Sarah')
+        - "this is Alice" -> ('save_person', 'Alice')
+        - "leave a note for Bob" -> ('note_request', 'Bob')
+        - "make a note for Sarah" -> ('note_request', 'Sarah')
+    """
+    if not text:
+        return None, None
+
+    text_lower = text.lower().strip()
+
+    # Save person patterns (multiple variations for flexibility)
+    save_patterns = [
+        r'(?:helios,?\s+)?(?:remember|save)\s+this\s+person\s+as\s+(.+)',  # "remember this person as John"
+        r'(?:helios,?\s+)?(?:remember|save)\s+this\s+as\s+(.+)',           # "remember this as John"
+        r'(?:helios,?\s+)?this\s+is\s+(.+)',                                # "this is John"
+    ]
+
+    for pattern in save_patterns:
+        match = re.match(pattern, text_lower)
+        if match:
+            name = match.group(1).strip()
+            # Avoid false positives (filter out common phrases)
+            if len(name) >= 2 and not any(word in name for word in ['to ', 'that ', 'the ', 'a ']):
+                return 'save_person', name
+
+    # Note request patterns (multiple variations for flexibility)
+    note_patterns = [
+        r'(?:helios,?\s+)?(?:leave|make|save|take)\s+a\s+note\s+(?:for|about)\s+(.+)',
+        r'(?:helios,?\s+)?note\s+(?:for|about)\s+(.+)',
+    ]
+
+    for pattern in note_patterns:
+        match = re.match(pattern, text_lower)
+        if match:
+            name = match.group(1).strip()
+            if len(name) >= 2:
+                return 'note_request', name
+
+    return None, None
+
+
+# ============================================================================
+# WEBSOCKET EVENT HANDLERS
+# ============================================================================
 
 @sio.event
 async def connect(sid, environ):
@@ -336,6 +493,7 @@ async def video_frame_streaming(sid, data):
         
         logger.info(f"⚡ YOLO: {inference_ms:.1f}ms (Avg: {avg_inference_ms:.1f}ms | Max FPS: {potential_fps:.1f})")
 
+        # Process detections
         det = process_detections(results, h, w)
         objects, clusters, emergency_stop = det['objects'], det['clusters'], det['emergency_stop']
         summary = generate_summary(objects, clusters)
@@ -355,10 +513,45 @@ async def video_frame_streaming(sid, data):
             assistant.latest_yolo = yolo_results
 
         if user_question:
-            async with gemini_vision_lock:
-                resp = await assistant.process_user_speech(user_question)
-                await sio.emit('text_response', {'text': resp, 'mode': 'conversation', 'emergency': False}, room=sid)
+            # CONVERSATION PIPELINE
+            logger.info(f"🎤 USER QUESTION: '{user_question}' | SID: {sid}")
+
+            # Check for person memory commands (from face-detection branch)
+            command_type, person_name = detect_person_command(user_question)
+
+            if command_type == 'note_request':
+                logger.info(f"📝 Note request for: {person_name}")
+                await sio.emit('note_request_acknowledged', {
+                    'person_name': person_name,
+                    'message': f'Listening for note about {person_name}'
+                }, room=sid)
+                return
+
+            elif command_type == 'save_person':
+                logger.info(f"💾 Save person request for: {person_name}")
+                await sio.emit('save_person_acknowledged', {
+                    'person_name': person_name,
+                    'message': f'Ready to save {person_name}'
+                }, room=sid)
+                return
+
+            # Regular question processing
+            try:
+                async with gemini_vision_lock:
+                    response_text = await assistant.process_user_speech(user_question)
+                    logger.info(f"✅ Response: {len(response_text)} chars")
+
+                    await sio.emit('text_response', {
+                        'text': response_text,
+                        'mode': 'conversation',
+                        'emergency': False
+                    }, room=sid)
+
+            except Exception as e:
+                logger.error(f"❌ Error: {e}", exc_info=True)
+                await sio.emit('error', {'message': f'Failed to process question: {e}'}, room=sid)
         else:
+            # VISION PIPELINE (from navigation branch)
             resp = await assistant.process_frame(base64_frame, yolo_results)
             if resp:
                 nav_active = bool(getattr(assistant, "navigation_state", None) and assistant.navigation_state.active)
@@ -372,29 +565,42 @@ async def video_frame_streaming(sid, data):
                         },
                         room=sid
                     )
-                else:
-                    await sio.emit('text_response', {'text': resp, 'mode': 'vision', 'emergency': "STOP" in resp}, room=sid)
-                
+                await sio.emit('text_response', {'text': resp, 'mode': 'vision', 'emergency': "STOP" in resp}, room=sid)
+
                 # Save debug frame ONLY if a warning/response was triggered
                 if SAVE_DEBUG_FRAMES:
                     try:
                         os.makedirs(DEBUG_OUTPUT_DIR, exist_ok=True)
                         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
                         filename = f"{DEBUG_OUTPUT_DIR}/alert_{timestamp}.jpg"
-                        
-                        # Use the annotated frame for debugging
+
                         ann = annotate_frame(image, objects, emergency_stop)
-                        
-                        # Add motion info to the saved image
                         cv2.putText(ann, f"Speed: {speed:.2f} m/s | Moving: {is_moving}", (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
                         cv2.putText(ann, f"Reason: {resp}", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-                        
+
                         cv2.imwrite(filename, ann)
                         logger.info(f"💾 Saved alert debug frame: {filename}")
                     except Exception as save_err:
                         logger.error(f"Failed to save debug frame: {save_err}")
 
-        # Emit raw detection data for frontend visualization
+            # Check for new person detections (from face-detection branch)
+            person_notification = assistant.get_person_detection_notification()
+            if person_notification:
+                logger.info(f"👋 New person: {person_notification['person_name']}")
+
+                await sio.emit('person_detected', {
+                    'person_id': person_notification['person_id'],
+                    'person_name': person_notification['person_name'],
+                    'notes': person_notification['notes']
+                }, room=sid)
+
+                await sio.emit('text_response', {
+                    'text': person_notification['message'],
+                    'mode': 'person_detection',
+                    'emergency': False
+                }, room=sid)
+
+        # Emit detection data for frontend (from navigation branch)
         await sio.emit('detection_update', {
             'objects': objects,
             'motion': yolo_results['motion'],
@@ -408,14 +614,174 @@ async def video_frame_streaming(sid, data):
             }
         }, room=sid)
 
-        if debug_mode:
-            ann = annotate_frame(image, objects, emergency_stop)
-            _, buf = cv2.imencode('.jpg', ann)
-            await sio.emit('debug_frame', {'frame': f"data:image/jpeg;base64,{base64.b64encode(buf).decode()}", 'summary': summary, 'mode': 'vision'}, room=sid)
+        total_time = (asyncio.get_event_loop().time() - start_time) * 1000
+
+        # Detailed timing breakdown for latency monitoring
+        if user_question:
+            logger.info(
+                f"✅ [CONVERSATION] COMPLETE: {total_time:.0f}ms total | "
+                f"YOLO: {inference_ms:.0f}ms | "
+                f"Objects: {len(objects)}"
+            )
+        else:
+            # Vision pipeline - just cache update
+            logger.debug(
+                f"✅ [VISION] COMPLETE: {total_time:.0f}ms | "
+                f"YOLO: {inference_ms:.0f}ms | Objects: {len(objects)} | "
+                f"Emergency: {emergency_stop}"
+            )
 
     except Exception as e:
         logger.error(f"Error: {e}")
         await sio.emit('error', {'message': str(e)}, room=sid)
+
+
+@sio.event
+async def save_person(sid, data):
+    """
+    Save a new person's face when user says "remember this person as [name]".
+
+    Expected data:
+    {
+        'name': str,           # Person's name from speech recognition
+        'frame': str           # Base64 image with face to save
+    }
+    """
+    try:
+        person_name = data.get('name')
+        frame_base64 = data.get('frame')
+
+        if not person_name:
+            await sio.emit('error', {
+                'message': 'Missing person name'
+            }, room=sid)
+            return
+
+        if not frame_base64:
+            await sio.emit('error', {
+                'message': 'Missing frame data'
+            }, room=sid)
+            return
+
+        logger.info(f"💾 Saving new person: {person_name}")
+
+        # Decode frame
+        image = decode_base64_image(frame_base64)
+
+        # Save to face database
+        if not assistant:
+            await sio.emit('error', {
+                'message': 'Assistant service not available'
+            }, room=sid)
+            return
+
+        person_id = assistant.face_service.add_known_person(
+            name=person_name,
+            face_image=image
+        )
+
+        logger.info(f"✅ Saved new person: {person_name} (ID: {person_id})")
+
+        confirmation_message = f"I'll remember {person_name}."
+
+        await sio.emit('person_saved', {
+            'name': person_name,
+            'person_id': person_id,
+            'message': confirmation_message
+        }, room=sid)
+
+        # Send TTS confirmation
+        await sio.emit('text_response', {
+            'text': confirmation_message,
+            'mode': 'person_memory',
+            'emergency': False
+        }, room=sid)
+
+    except ValueError as e:
+        logger.error(f"❌ Validation error saving person: {e}")
+        await sio.emit('error', {
+            'message': str(e)
+        }, room=sid)
+    except Exception as e:
+        logger.error(f"❌ Error saving person: {e}", exc_info=True)
+        await sio.emit('error', {
+            'message': f'Failed to save person: {str(e)}'
+        }, room=sid)
+
+
+@sio.event
+async def save_note(sid, data):
+    """
+    Save a note for a person when user says "leave a note for [name]".
+
+    Expected data:
+    {
+        'person_name': str,    # Target person's name
+        'note_text': str       # The note content
+    }
+    """
+    try:
+        person_name = data.get('person_name')
+        note_text = data.get('note_text')
+
+        if not person_name:
+            await sio.emit('error', {
+                'message': 'Missing person name'
+            }, room=sid)
+            return
+
+        if not note_text:
+            await sio.emit('error', {
+                'message': 'Missing note text'
+            }, room=sid)
+            return
+
+        logger.info(f"📝 Saving note for {person_name}: {note_text[:50]}{'...' if len(note_text) > 50 else ''}")
+
+        if not assistant:
+            await sio.emit('error', {
+                'message': 'Assistant service not available'
+            }, room=sid)
+            return
+
+        # Lookup person by name
+        person = assistant.face_service.get_person_by_name(person_name)
+
+        if not person:
+            await sio.emit('error', {
+                'message': f"I don't know anyone named {person_name}. Please save their face first."
+            }, room=sid)
+            return
+
+        # Save note to ChromaDB
+        assistant.note_service.add_note(
+            person_id=person.person_id,
+            person_name=person_name,
+            note_text=note_text
+        )
+
+        logger.info(f"✅ Saved note for {person_name}")
+
+        confirmation_message = f"Note saved for {person_name}: {note_text}"
+
+        await sio.emit('note_saved', {
+            'person_name': person_name,
+            'note_text': note_text,
+            'message': confirmation_message
+        }, room=sid)
+
+        # Send TTS confirmation (repeat the note back)
+        await sio.emit('text_response', {
+            'text': confirmation_message,
+            'mode': 'person_memory',
+            'emergency': False
+        }, room=sid)
+
+    except Exception as e:
+        logger.error(f"❌ Error saving note: {e}", exc_info=True)
+        await sio.emit('error', {
+            'message': f'Failed to save note: {str(e)}'
+        }, room=sid)
 
 
 @sio.event

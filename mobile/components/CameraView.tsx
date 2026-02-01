@@ -25,6 +25,18 @@ export default function CameraView({ onFrame, getPendingQuestion, onFrameCapture
   const captureInterval = useRef<ReturnType<typeof setInterval> | null>(null);
   const isCapturing = useRef(false);
 
+  // Use refs to always have access to latest callbacks (avoids stale closure in setInterval)
+  const onFrameRef = useRef(onFrame);
+  const getPendingQuestionRef = useRef(getPendingQuestion);
+  const onFrameCapturedRef = useRef(onFrameCaptured);
+
+  // Keep refs up to date
+  useEffect(() => {
+    onFrameRef.current = onFrame;
+    getPendingQuestionRef.current = getPendingQuestion;
+    onFrameCapturedRef.current = onFrameCaptured;
+  }, [onFrame, getPendingQuestion, onFrameCaptured]);
+
   const captureFrame = useCallback(async () => {
     if (camera.current == null || isCapturing.current) return;
 
@@ -49,14 +61,12 @@ export default function CameraView({ onFrame, getPendingQuestion, onFrameCapture
       reader.onloadend = () => {
         const base64 = reader.result as string;
         const base64Data = base64.split(",")[1];
-        
-        // Notify about frame capture (for person memory)
-        if (onFrameCaptured) {
-          onFrameCaptured(base64Data);
-        }
+
+        // Notify about the captured frame (for person memory feature)
+        onFrameCapturedRef.current?.(base64Data);
 
         // Check for pending question from wake word detection
-        const pendingQuestion = getPendingQuestion?.();
+        const pendingQuestion = getPendingQuestionRef.current?.();
         
         if (pendingQuestion) {
           console.log(
@@ -68,7 +78,9 @@ export default function CameraView({ onFrame, getPendingQuestion, onFrameCapture
           // );
         }
 
-        onFrame(base64Data, pendingQuestion);
+        // Enable debug mode to see bounding boxes on frames
+        const DEBUG_MODE = true;
+        onFrameRef.current(base64Data, pendingQuestion, DEBUG_MODE);
       };
 
       reader.readAsDataURL(blob);
@@ -77,7 +89,7 @@ export default function CameraView({ onFrame, getPendingQuestion, onFrameCapture
     } finally {
       isCapturing.current = false;
     }
-  }, [onFrame, getPendingQuestion, onFrameCaptured]);
+  }, []); // No dependencies - uses refs for latest values
 
   useEffect(() => {
     if (hasPermission === false) {

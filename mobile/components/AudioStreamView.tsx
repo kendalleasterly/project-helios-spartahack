@@ -143,6 +143,8 @@ export const AudioStreamView = ({
   onToggleDiagnostics,
   ttsStatus,
   getPendingQuestion,
+  waitingForNote,
+  accumulatedNote,
   speedMps,
 }: AudioStreamViewProps) => {
   const insets = useSafeAreaInsets();
@@ -234,7 +236,7 @@ export const AudioStreamView = ({
           getPendingQuestion={getPendingQuestion}
           onFrameCaptured={onFrameCaptured}
         />
-        
+
         {/* Detection Overlay */}
         <View style={StyleSheet.absoluteFill} pointerEvents="none">
           {/* Path Detection Oval (matches server logic) */}
@@ -368,17 +370,51 @@ export const AudioStreamView = ({
               {deepgramStatusMeta.label}
             </Text>
           </View>
-          
-          {/* Speed Display: Instant vs Average */}
-          {(typeof speedMps === "number" || typeof instantSpeed === "number") && (
+
+          {/* Note recording status (from face-detection) */}
+          {waitingForNote && (
+            <View style={[styles.pill, { backgroundColor: "#FEF3C7" }]}>
+              <View style={[styles.statusDot, { backgroundColor: "#D97706" }]} />
+              <Text style={[styles.pillText, { color: "#D97706" }]}>
+                Note for {waitingForNote}...
+              </Text>
+            </View>
+          )}
+
+          {/* Speed Display (from navigation) */}
+          {(typeof speedMps === "number") && (
             <View style={[styles.pill, { backgroundColor: "#DBEAFE" }]}>
               <View style={[styles.statusDot, { backgroundColor: "#1D4ED8" }]} />
               <Text style={[styles.pillText, { color: "#1D4ED8" }]}>
-                Speed: {instantSpeed !== undefined ? instantSpeed.toFixed(2) : '-'} (curr) / {speedMps?.toFixed(2) ?? '-'} (avg) m/s
+                Speed: {speedMps.toFixed(2)} m/s
               </Text>
             </View>
           )}
         </View>
+
+        {/* Note accumulation feedback panel */}
+        {waitingForNote && (
+          <View style={styles.notePanel}>
+            <Text style={styles.notePanelTitle}>
+              Recording note for {waitingForNote}
+            </Text>
+            <Text style={styles.notePanelText}>
+              {accumulatedNote || "(listening...)"}
+            </Text>
+            <View style={styles.notePanelButtons}>
+              {onFinalizeNote && accumulatedNote && (
+                <View style={styles.noteButtonWrap}>
+                  <Button title="Done" onPress={onFinalizeNote} />
+                </View>
+              )}
+              {onCancelNote && (
+                <View style={styles.noteButtonWrap}>
+                  <Button title="Cancel" onPress={onCancelNote} color="#B91C1C" />
+                </View>
+              )}
+            </View>
+          </View>
+        )}
 
         <View style={styles.controlPanel}>
           <View style={styles.controls}>
@@ -645,22 +681,43 @@ const styles = StyleSheet.create({
 		fontSize: 12,
 		color: "#64748B",
 	},
-  noteButtonWrap: {
-    flex: 1,
-  },
-  gridContainer: {
-    ...StyleSheet.absoluteFillObject,
-    flexDirection: 'row',
-    justifyContent: 'space-evenly',
-  },
-  gridLineVertical: {
-    width: 1,
-    height: '100%',
-    backgroundColor: 'rgba(255, 255, 255, 0.2)',
-  },
-  gridLineHorizontal: {
-    height: 1,
-    width: '100%',
-    backgroundColor: 'rgba(255, 255, 255, 0.2)',
-  },
+	notePanel: {
+		backgroundColor: "rgba(251, 191, 36, 0.9)",
+		borderRadius: 16,
+		padding: 16,
+		gap: 8,
+	},
+	notePanelTitle: {
+		fontSize: 14,
+		fontWeight: "700",
+		color: "#78350F",
+	},
+	notePanelText: {
+		fontSize: 16,
+		color: "#451A03",
+		fontStyle: "italic",
+	},
+	notePanelButtons: {
+		flexDirection: "row",
+		gap: 10,
+		marginTop: 8,
+	},
+	noteButtonWrap: {
+		flex: 1,
+	},
+	gridContainer: {
+		...StyleSheet.absoluteFillObject,
+		flexDirection: "row",
+		justifyContent: "space-evenly",
+	},
+	gridLineVertical: {
+		width: 1,
+		height: "100%",
+		backgroundColor: "rgba(255, 255, 255, 0.2)",
+	},
+	gridLineHorizontal: {
+		height: 1,
+		width: "100%",
+		backgroundColor: "rgba(255, 255, 255, 0.2)",
+	},
 });

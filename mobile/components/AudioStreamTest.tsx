@@ -19,7 +19,7 @@ export function MicStreamTest() {
   // by looking for the last transcript we processed.
   const lastProcessedTranscriptRef = useRef<string | null>(null);
 
-  // Enable sensor streaming (auto-sends to backend)
+  // Enable sensor streaming (auto-sends to backend) from navigation
   useDeviceSensors({
     enabled: backendStatus === "connected",
     onSensorUpdate: sendDeviceSensors,

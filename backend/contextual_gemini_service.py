@@ -9,6 +9,8 @@ import json
 import os
 import re
 import time
+import cv2
+import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional, AsyncGenerator, List, Dict, Any
 from collections import deque
@@ -17,6 +19,11 @@ from dotenv import load_dotenv
 from google import genai
 from google.genai.types import Part, GenerateContentConfig, ThinkingConfig
 
+# Person memory services
+from face_service import FaceService
+from note_service import NoteService
+
+# Heuristics engine for collision detection
 from heuristics import evaluate_scene, UrgencyLevel, SpeakDecision, HeuristicsConfig
 
 load_dotenv()
@@ -47,13 +54,13 @@ STAY SILENT when:
 ## HOW TO SPEAK (be actionable!)
 Be VERY brief. Prefer 5-10 words, max 15 words unless navigation requires more.
 Give INSTRUCTIONS, not descriptions:
-- ❌ "There is a chair on your left" 
+- ❌ "There is a chair on your left"
 - ✅ "Chair left, 4 feet. Keep right to pass."
 
 - ❌ "I see a door ahead"
 - ✅ "Door ahead, 8 feet. Walk straight."
 
-- ❌ "A person is detected"  
+- ❌ "A person is detected"
 - ✅ "Person ahead, stepping aside. Wait 2 seconds."
 
 Use this format:
@@ -80,12 +87,11 @@ Respond with the spoken guidance only.
 
 You are a GUIDE, not a narrator. The user is walking and needs real-time help:
 - Short beats long
-- Actions beat descriptions  
+- Actions beat descriptions
 - Safety beats politeness
 - Speaking beats missing an obstacle
 
 If in doubt, SPEAK. A false alert is better than a collision."""
-
 
 CONVERSATION_SYSTEM_PROMPT = """You are Helios, a helpful vision assistant for a blind person.
 
@@ -237,13 +243,6 @@ class GeminiContextualNarrator:
 
         parts = []
 
-        # Urgency level (for vision mode with heuristics)
-        if urgency_level:
-            parts.append(f"⚡ URGENCY: {urgency_level}")
-            if urgency_reason:
-                parts.append(f"   Reason: {urgency_reason}")
-            parts.append("")
-
         # Recent history (for vision model context)
         if recent_history:
             parts.append(f"📜 RECENT HISTORY:\n{recent_history}\n")
@@ -319,9 +318,16 @@ class GeminiContextualNarrator:
         if user_question:
             parts.append(f"\n👤 USER QUESTION: \"{user_question}\"")
         else:
-            parts.append("\n👤 User is walking (vision monitoring mode)")
+            parts.append("\n👤 User is walking (monitoring mode, no question)")
 
-        return "\n".join(parts)
+        prompt = "\n".join(parts)
+
+        # Log the complete text prompt being sent to Gemini
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"📝 GEMINI TEXT PROMPT:\n{'-' * 80}\n{prompt}\n{'-' * 80}")
+
+        return prompt
 
     def _add_to_history(self, role: str, content: str):
         """Add message to history and trim if needed."""
@@ -384,6 +390,16 @@ class GeminiContextualNarrator:
             "parts": [image_part, {"text": context_prompt}]
         })
 
+        # Log the full conversation history being sent to Gemini
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"🧠 GEMINI CONVERSATION HISTORY ({len(self.context_history)} messages):")
+        for i, msg in enumerate(self.context_history, 1):
+            role_emoji = "👤" if msg["role"] == "user" else "🤖"
+            content_preview = msg["content"][:100] + "..." if len(msg["content"]) > 100 else msg["content"]
+            logger.info(f"   {i}. {role_emoji} {msg['role'].upper()}: {content_preview}")
+        logger.info(f"🖼️  GEMINI CURRENT INPUT: Image + Text Prompt (see above for text)")
+
         # Call Gemini with streaming
         # Note: Using Gemini 3 Flash with minimal thinking for faster responses
         # Minimal thinking reduces token usage by ~30% while maintaining quality
@@ -401,7 +417,9 @@ class GeminiContextualNarrator:
         )
 
         first_chunk_time = None
+        should_speak = None
         full_response = ""
+        prefix_removed = False
 
         try:
             chunk_count = 0
@@ -410,17 +428,46 @@ class GeminiContextualNarrator:
                 chunk_count += 1
 
                 if chunk.text:
-                    logger.info(f"📦 Chunk #{chunk_count}: '{chunk.text}' (len={len(chunk.text)})")
+                    logger.debug(f"📦 Chunk #{chunk_count} (len={len(chunk.text)})")
 
                     if first_chunk_time is None:
                         first_chunk_time = time.perf_counter()
                         logger.info(f"⏱️  First chunk received after {(first_chunk_time - start_time)*1000:.0f}ms")
 
                     full_response += chunk.text
+                    logger.debug(f"📝 Response length: {len(full_response)}")
 
-                    # Heuristics already decided to speak, so always yield
-                    # (Vision mode: heuristics triggered, Conversation mode: always responds)
-                    yield (True, chunk.text)
+                    # Parse decision from first chunks (for vision mode with SPEAK:/SILENT: prefix)
+                    if should_speak is None:
+                        # Check if this uses the SPEAK:/SILENT: prefix format
+                        if full_response.startswith("SPEAK:") or full_response.startswith("SILENT:"):
+                            logger.debug(f"🔍 Checking for SPEAK:/SILENT: prefix")
+                            if full_response.startswith("SPEAK:"):
+                                should_speak = True
+                                # Remove prefix and yield clean text
+                                clean_text = full_response[6:].lstrip()
+                                logger.info(f"✅ SPEAK decision detected! Length: {len(clean_text)}")
+                                yield (True, clean_text)
+                                prefix_removed = True
+                            elif full_response.startswith("SILENT:"):
+                                should_speak = False
+                                # Remove prefix
+                                clean_text = full_response[7:].lstrip()
+                                logger.info(f"🔇 SILENT decision detected")
+                                yield (False, clean_text)
+                                # Don't stream further if silent (save tokens/latency)
+                                break
+                            # Keep buffering if we don't have the full prefix yet
+                            continue
+                        else:
+                            # No prefix format - this is conversation mode, always speak
+                            logger.info(f"📝 No SPEAK:/SILENT: prefix - conversation mode (always speak)")
+                            should_speak = True
+                            yield (True, chunk.text)
+                    else:
+                        # Already determined decision, stream subsequent chunks
+                        logger.debug(f"➡️ Yielding chunk ({len(chunk.text)} chars)")
+                        yield (should_speak, chunk.text)
                 else:
                     # Empty chunk - check finish reason
                     logger.warning(f"⚠️ Empty chunk #{chunk_count}")
@@ -429,7 +476,7 @@ class GeminiContextualNarrator:
                             if hasattr(candidate, 'finish_reason'):
                                 logger.warning(f"⚠️ Finish reason: {candidate.finish_reason}")
 
-            logger.info(f"✅ Stream completed. Total chunks: {chunk_count} | Final response: '{full_response}'")
+            logger.info(f"✅ Stream completed. Total chunks: {chunk_count} | Length: {len(full_response)}")
         except Exception as e:
             logger.error(f"❌ Stream error after {chunk_count} chunks: {e}", exc_info=True)
             raise
@@ -438,6 +485,7 @@ class GeminiContextualNarrator:
 
         # Debug logging - show raw Gemini response
         logger.info(f"🔍 RAW GEMINI | Full response with prefix: '{full_response}'")
+        logger.debug(f"🔍 RAW GEMINI | Length: {len(full_response)}")
 
         # Update history
         self._add_to_history("user", context_prompt)
@@ -477,7 +525,7 @@ class GeminiContextualNarrator:
         # Debug logging
         import logging
         logger = logging.getLogger(__name__)
-        logger.info(f"🔍 GEMINI RESPONSE | Speak: {should_speak} | Text: '{full_text.strip()}' | Length: {len(full_text.strip())}")
+        logger.info(f"🔍 GEMINI RESPONSE | Speak: {should_speak} | Length: {len(full_text.strip())}")
 
         return StreamedResponse(
             should_speak=should_speak,
@@ -573,7 +621,28 @@ class BlindAssistantService:
         self.latest_frame: Optional[str] = None
         self.latest_yolo: Optional[Dict[str, Any]] = None
 
-        # Heuristics state tracking
+        # Person memory services
+        self.face_service = FaceService()
+        self.note_service = NoteService()
+
+        # Track currently visible person (largest known face)
+        self.current_person_id: Optional[str] = None
+        self.current_person_name: Optional[str] = None
+        self.current_person_detected_at: Optional[float] = None  # Timestamp of last detection
+        self.current_person_bbox: Optional[Dict[str, int]] = None  # Face bounding box (x, y, w, h)
+        self.current_person_location: Optional[str] = None  # Spatial location description
+
+        # Track ALL detected faces (known and unknown) for spatial awareness
+        self.all_detected_faces: List[Dict[str, Any]] = []  # List of {name, location, bbox, is_known}
+
+        # How long to trust a cached face detection (seconds)
+        # Note: With per-frame detection, this is mainly for backup/safety
+        self.face_detection_ttl: float = 2.0
+
+        # Track announced people (to avoid spam - announce once per session)
+        self._announced_people: set = set()  # Set of person_ids we've announced
+
+        # Heuristics state tracking for collision detection
         self.last_spoke_time: float = 0.0  # Timestamp of last speech output
         self.heuristics_config = HeuristicsConfig()
 
@@ -735,23 +804,133 @@ class BlindAssistantService:
         """
         Vision Pipeline: Process incoming frame (called every ~1 second).
 
-        Uses heuristics engine to decide when to call Gemini for proactive guidance.
-        Gemini is only called when heuristics determine something needs to be said.
+        NEW BEHAVIOR: Only speaks for immediate safety/emergency warnings.
+        Otherwise, silently builds spatial memory for future conversation queries.
 
         Args:
             frame_base64: Base64-encoded frame image
             yolo_objects: YOLO detection results with summary, objects, emergency flag
 
         Returns:
-            Text to speak if heuristics trigger, None otherwise
+            Text to speak ONLY for immediate danger (None otherwise)
         """
-        import logging
-        logger = logging.getLogger(__name__)
-
         # Update cache for conversation queries
         self.latest_frame = frame_base64
         self.latest_yolo = yolo_objects
 
+        # Clear cached person if YOLO no longer detects any people
+        # (person walked out of frame)
+        person_detected_by_yolo = any(
+            obj.get('label', '').lower() == 'person'
+            for obj in yolo_objects.get('objects', [])
+        )
+        if not person_detected_by_yolo and self.current_person_id:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f"🚶 Person left frame - clearing cached identity: {self.current_person_name}")
+            self.current_person_id = None
+            self.current_person_name = None
+            self.current_person_detected_at = None
+
+        # Face detection (run on EVERY frame for maximum accuracy)
+        # Face detection with async executor wrapper (prevents blocking event loop)
+        import logging
+        import asyncio
+        logger = logging.getLogger(__name__)
+
+        face_detection_start = time.time()
+        try:
+            # Decode frame for face detection
+            image_bytes = base64.b64decode(frame_base64)
+            nparr = np.frombuffer(image_bytes, np.uint8)
+            image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+            # Detect and recognize faces (run in thread pool to avoid blocking)
+            loop = asyncio.get_event_loop()
+            faces = await loop.run_in_executor(
+                None,  # Use default ThreadPoolExecutor
+                self.face_service.detect_and_recognize,
+                image
+            )
+
+            face_detection_ms = (time.time() - face_detection_start) * 1000
+
+            # Log face detection results for EVERY frame
+            if faces:
+                logger.info(f"👤 DEEPFACE: Detected {len(faces)} face(s) in {face_detection_ms:.0f}ms")
+                for i, face in enumerate(faces, 1):
+                    if face.person_id:
+                        distance_str = f", distance: {face.distance:.3f}" if face.distance is not None else ""
+                        logger.info(f"   {i}. KNOWN: {face.person_name} (confidence: {face.confidence:.2f}{distance_str})")
+                    else:
+                        logger.info(f"   {i}. UNKNOWN (confidence: {face.confidence:.2f})")
+            else:
+                logger.info(f"👤 DEEPFACE: No faces detected ({face_detection_ms:.0f}ms)")
+
+            # Get image dimensions for location calculation
+            image_height, image_width = image.shape[:2]
+
+            # Build list of ALL faces (known and unknown) with spatial info
+            self.all_detected_faces = []
+            for face in faces:
+                bbox_center_x = (face.bbox['x'] + face.bbox['w'] / 2)
+                bbox_center_y = (face.bbox['y'] + face.bbox['h'] / 2)
+                location = self._calculate_face_location(
+                    bbox_center_x, bbox_center_y, image_width, image_height
+                )
+
+                self.all_detected_faces.append({
+                    'name': face.person_name if face.person_id else 'unknown',
+                    'location': location,
+                    'bbox': face.bbox,
+                    'is_known': face.person_id is not None,
+                    'confidence': face.confidence
+                })
+
+            if faces and len(faces) > 0:
+                # If multiple faces, use the largest (closest to camera)
+                if len(faces) > 1:
+                    faces_sorted = sorted(
+                        faces,
+                        key=lambda f: f.bbox['w'] * f.bbox['h'],
+                        reverse=True
+                    )
+                    face = faces_sorted[0]
+                    logger.info(f"👥 {len(faces)} faces detected, using largest: {face.person_name or 'unknown'}")
+                else:
+                    face = faces[0]
+
+                self.current_person_id = face.person_id
+                self.current_person_name = face.person_name
+                self.current_person_detected_at = time.time()  # Record detection time
+                self.current_person_bbox = face.bbox
+
+                # Calculate spatial location from bbox
+                image_height, image_width = image.shape[:2]
+                bbox_center_x = (face.bbox['x'] + face.bbox['w'] / 2)
+                bbox_center_y = (face.bbox['y'] + face.bbox['h'] / 2)
+                self.current_person_location = self._calculate_face_location(
+                    bbox_center_x, bbox_center_y, image_width, image_height
+                )
+
+                # Update last_seen timestamp if person is known
+                if face.person_id:
+                    self.face_service.update_last_seen(face.person_id)
+            else:
+                # No face detected - clear cached person
+                self.current_person_id = None
+                self.current_person_name = None
+                self.current_person_detected_at = None
+                self.current_person_bbox = None
+                self.current_person_location = None
+                self.all_detected_faces = []
+                logger.debug(f"No faces detected in frame")
+
+        except Exception as e:
+            face_detection_ms = (time.time() - face_detection_start) * 1000
+            logger.error(f"Error in face detection after {face_detection_ms:.0f}ms: {e}", exc_info=True)
+
+        # Use heuristics engine to decide if we should speak
         # Calculate time since last speech for debouncing
         current_time = time.time()
         last_spoke_seconds_ago = current_time - self.last_spoke_time
@@ -787,6 +966,7 @@ class BlindAssistantService:
 
         def record_fast_path_response(raw_text: str, urgency: UrgencyLevel) -> str:
             response_text = raw_text
+            logger.info(f"🔊 COLLISION WARNING | Urgency: {urgency.value}")
 
             # Simple cleanup for common patterns
             if response_text.startswith("Immediate:"):
@@ -877,6 +1057,55 @@ class BlindAssistantService:
 
         return response.full_text if response.full_text else None
 
+    def get_person_detection_notification(self) -> Optional[Dict[str, Any]]:
+        """
+        Check if a new person was detected and return notification info.
+
+        Returns notification once per person per session (to avoid spam).
+        Call this after process_frame() to get person detection notifications.
+
+        Returns:
+            Dict with person info if new person detected, None otherwise
+            {
+                'person_id': str,
+                'person_name': str,
+                'notes': List[str],
+                'message': str  # TTS-ready message
+            }
+        """
+        if not self.current_person_id or not self.current_person_name:
+            return None
+
+        # Check if we've already announced this person this session
+        if self.current_person_id in self._announced_people:
+            return None
+
+        # New person detected! Mark as announced and return notification
+        self._announced_people.add(self.current_person_id)
+
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"👋 New person detected this session: {self.current_person_name}")
+
+        # Get notes for this person
+        notes = self.note_service.get_notes_for_person(
+            self.current_person_id,
+            limit=3  # Only first 3 notes for announcement
+        )
+
+        # Build notification message
+        if notes:
+            message = f"I see {self.current_person_name}. Remember: {notes[0]}"
+        else:
+            message = f"I see {self.current_person_name}."
+
+        return {
+            'person_id': self.current_person_id,
+            'person_name': self.current_person_name,
+            'notes': notes,
+            'message': message
+        }
+
     async def process_user_speech(
         self,
         user_question: str
@@ -904,13 +1133,94 @@ class BlindAssistantService:
         logger.info(f"✅ Latest frame available | Has YOLO: {self.latest_yolo is not None}")
 
         # Build enriched spatial context from vision history
+        # Note: Person detection already happened in process_frame() @ 1 FPS
+        # so self.current_person_id/name should be fresh (< 1 second old)
         logger.info("🔨 Building spatial context from vision history...")
         spatial_context = self._build_spatial_context()
-        logger.info(f"📝 Spatial context built: {len(spatial_context)} chars")
+        logger.info(f"📝 SPATIAL CONTEXT ({len(spatial_context)} chars):\n{'-' * 80}\n{spatial_context}\n{'-' * 80}")
+
+        # Add person notes if someone is recognized
+        # (Since we run face detection on every frame, detection should always be fresh)
+        person_context = ""
+        if self.current_person_id and self.current_person_name and self.current_person_detected_at:
+            # Check if detection is still fresh (safety check, should always be < 1 second)
+            detection_age = time.time() - self.current_person_detected_at
+
+            if detection_age < self.face_detection_ttl:
+                logger.info(f"👤 Person recognized: {self.current_person_name} (ID: {self.current_person_id}, age: {detection_age:.1f}s)")
+
+                # ALWAYS add person identity info (even without notes)
+                person_context = f"\n\n[PERSON CONTEXT]\n"
+                person_context += f"IMPORTANT: You recognize this person! Their name is {self.current_person_name}.\n"
+
+                # Add location info if available
+                if self.current_person_location:
+                    location_readable = self.current_person_location.replace('-', ' ')
+                    person_context += f"LOCATION: {self.current_person_name} is detected in the {location_readable} of the frame.\n"
+
+                person_context += f"If asked about identity (who/what's their name/etc), tell them it's {self.current_person_name}.\n"
+
+                # Add notes if available
+                notes = self.note_service.get_notes_for_person(
+                    self.current_person_id,
+                    limit=5
+                )
+
+                if notes:
+                    person_context += f"\nNotes to remember about {self.current_person_name}:\n"
+                    for i, note in enumerate(notes, 1):
+                        person_context += f"{i}. {note}\n"
+                    logger.info(f"📝 Added identity + {len(notes)} notes for {self.current_person_name}")
+                else:
+                    logger.info(f"📝 Added identity for {self.current_person_name} (no notes yet)")
+
+                # Add info about ALL detected faces (known and unknown)
+                if len(self.all_detected_faces) > 0:
+                    person_context += f"\n[ALL FACES IN FRAME]\n"
+                    for i, face_info in enumerate(self.all_detected_faces, 1):
+                        location_readable = face_info['location'].replace('-', ' ')
+                        if face_info['is_known']:
+                            person_context += f"{i}. {face_info['name']} (KNOWN) - {location_readable}\n"
+                        else:
+                            person_context += f"{i}. Unknown person - {location_readable}\n"
+                    person_context += "\nIMPORTANT: If asked 'who is that' and someone points to center/main person, check which face is in that location!\n"
+
+            else:
+                # Detection is stale (shouldn't happen with per-frame detection)
+                logger.warning(f"⏰ Face detection unexpectedly expired ({detection_age:.1f}s > {self.face_detection_ttl}s)")
+                self.current_person_id = None
+                self.current_person_name = None
+                self.current_person_detected_at = None
+        elif self.current_person_id is None:
+            # No known person, but check for unknown faces
+            if len(self.all_detected_faces) > 0:
+                person_context = f"\n\n[UNKNOWN FACES DETECTED]\n"
+                for i, face_info in enumerate(self.all_detected_faces, 1):
+                    location_readable = face_info['location'].replace('-', ' ')
+                    person_context += f"{i}. Unknown person - {location_readable}\n"
+                logger.info(f"👤 {len(self.all_detected_faces)} unknown face(s) detected")
+            else:
+                # Check if YOLO detected a person but face detection didn't recognize them
+                yolo_person_detected = any(
+                    obj.get('label', '').lower() == 'person'
+                    for obj in self.latest_yolo.get('objects', [])
+                ) if self.latest_yolo else False
+
+                if yolo_person_detected:
+                    logger.info("👤 Person in frame but no face detected")
+                else:
+                    logger.debug("No person currently in frame")
+
+        # Combine spatial + person context
+        full_context = spatial_context + person_context
+
+        # Log person context if present
+        if person_context:
+            logger.info(f"👤 PERSON CONTEXT ({len(person_context)} chars):\n{'-' * 80}\n{person_context}\n{'-' * 80}")
 
         # Create scene analysis with spatial context
         scene_analysis = {
-            "summary": spatial_context,
+            "summary": full_context,  # Include person notes
             "objects": self.latest_yolo.get("objects", []) if self.latest_yolo else [],
             "emergency_stop": False  # User questions aren't emergencies
         }
@@ -931,7 +1241,7 @@ class BlindAssistantService:
             user_question=user_question
         )
 
-        logger.info(f"✅ Got response | Should speak: {response.should_speak} | Text: '{response.full_text}' | Length: {len(response.full_text)}")
+        logger.info(f"✅ Got response | Should speak: {response.should_speak} | Length: {len(response.full_text)}")
 
         spoken_text, nav_update = self._extract_nav_state_block(response.full_text)
         if nav_update:
@@ -969,7 +1279,7 @@ class BlindAssistantService:
 
         # If only one scene, this is likely the first few frames
         if len(recent_scenes) == 1:
-            return f"Previous: {self._summarize_scene(recent_scenes[0])}"
+            return f"Previous: {recent_scenes[0].scene_description}"
 
         # Build compact history (last 3-5 observations with timing)
         history_items = []
@@ -982,49 +1292,75 @@ class BlindAssistantService:
             else:
                 time_str = f"{seconds_ago}s ago"
 
-            desc = self._summarize_scene(scene)
+            # Extract just the description (remove SPEAK:/SILENT: prefix if present)
+            desc = scene.scene_description
+            if desc.startswith("SPEAK: "):
+                desc = desc[7:].strip()
+            elif desc.startswith("SILENT: "):
+                desc = desc[8:].strip()
+
             history_items.append(f"[{time_str}] {desc}")
 
         return "\n".join(history_items)
 
-    def _summarize_scene(self, scene: SceneSnapshot) -> str:
+    def _calculate_face_location(
+        self,
+        center_x: float,
+        center_y: float,
+        image_width: int,
+        image_height: int
+    ) -> str:
         """
-        Build a useful summary from a scene snapshot.
+        Calculate spatial location of face using 3x3 grid (same as YOLO).
 
-        For frames where Gemini spoke, uses the actual response.
-        For silent frames, builds a summary from YOLO data.
+        Returns description like "top-left", "mid-center", "bottom-right"
         """
-        desc = scene.scene_description
+        # Calculate relative positions (0.0 to 1.0)
+        relative_x = center_x / image_width
+        relative_y = center_y / image_height
 
-        # If we have a real Gemini response (not a heuristics reason), use it
-        if desc and not desc.startswith("Clear path") and not desc.startswith("In path:") \
-                and not desc.startswith("Immediate:") and not desc.startswith("New:") \
-                and not desc.startswith("Emergency"):
-            # This is likely an actual Gemini response
-            if desc.startswith("SPEAK: "):
-                return desc[7:].strip()
-            return desc
+        # Determine horizontal zone
+        if relative_x < 0.33:
+            horizontal = "left"
+        elif relative_x < 0.66:
+            horizontal = "center"
+        else:
+            horizontal = "right"
 
-        # For silent frames or heuristic-only frames, build from YOLO data
-        objects = scene.yolo_objects.get("objects", [])
-        if not objects:
-            return "Clear path"
+        # Determine vertical zone
+        if relative_y < 0.33:
+            vertical = "top"
+        elif relative_y < 0.66:
+            vertical = "mid"
+        else:
+            vertical = "bottom"
 
-        # Build compact object summary
-        obj_summaries = []
-        for obj in objects[:4]:  # Max 4 objects
-            label = obj.get("label", "object")
-            pos = obj.get("position", "")
-            dist = obj.get("distance", "")
+        return f"{vertical}-{horizontal}"
 
-            if pos and dist:
-                obj_summaries.append(f"{label} ({pos}, {dist})")
-            elif pos:
-                obj_summaries.append(f"{label} ({pos})")
-            else:
-                obj_summaries.append(label)
+    def _get_recent_object_labels(self, lookback_seconds: float = 10.0) -> set[str]:
+        """
+        Get labels of objects seen in the recent past for debouncing.
 
-        return ", ".join(obj_summaries) if obj_summaries else "Clear path"
+        Args:
+            lookback_seconds: How far back to look (default 10 seconds)
+
+        Returns:
+            Set of object labels seen recently
+        """
+        if not self.scene_history:
+            return set()
+
+        cutoff_time = time.time() - lookback_seconds
+        recent_labels: set[str] = set()
+
+        for scene in self.scene_history:
+            if scene.timestamp >= cutoff_time:
+                for obj in scene.yolo_objects.get("objects", []):
+                    label = obj.get("label")
+                    if label:
+                        recent_labels.add(label)
+
+        return recent_labels
 
     def _check_immediate_danger(self, yolo_objects: Dict[str, Any]) -> Optional[str]:
         """
@@ -1059,31 +1395,6 @@ class BlindAssistantService:
                 return f"Careful! Stairs {position}!"
 
         return None
-
-    def _get_recent_object_labels(self, lookback_seconds: float = 10.0) -> set[str]:
-        """
-        Get labels of objects seen in the recent past for debouncing.
-
-        Args:
-            lookback_seconds: How far back to look (default 10 seconds)
-
-        Returns:
-            Set of object labels seen recently
-        """
-        if not self.scene_history:
-            return set()
-
-        cutoff_time = time.time() - lookback_seconds
-        recent_labels: set[str] = set()
-
-        for scene in self.scene_history:
-            if scene.timestamp >= cutoff_time:
-                for obj in scene.yolo_objects.get("objects", []):
-                    label = obj.get("label")
-                    if label:
-                        recent_labels.add(label)
-
-        return recent_labels
 
     def _build_spatial_context(self) -> str:
         """

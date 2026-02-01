@@ -84,7 +84,15 @@ export function MicStreamTest() {
   }, []);
 
   // Initialize audio guidance (TTS)
-  const { isSpeaking, isReady, isInitializing, error: ttsError, stopSpeaking } = useAudioGuidance({
+  const {
+    isSpeaking,
+    isReady,
+    isInitializing,
+    error: ttsError,
+    stopSpeaking,
+    lastSpokenText,
+    lastSpokenAt,
+  } = useAudioGuidance({
     onTextToken,
     enabled: true,
   });
@@ -168,6 +176,8 @@ export function MicStreamTest() {
         isReady,
         isInitializing,
         error: ttsError,
+        lastSpokenText,
+        lastSpokenAt,
       }}
     />
   );

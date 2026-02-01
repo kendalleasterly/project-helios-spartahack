@@ -30,6 +30,8 @@ type TTSStatus = {
   isReady: boolean;
   isInitializing: boolean;
   error: string | null;
+  lastSpokenText: string | null;
+  lastSpokenAt: number | null;
 };
 
 type AudioStreamViewProps = {
@@ -39,7 +41,7 @@ type AudioStreamViewProps = {
   onSendFrame: (base64Frame: string, userQuestion?: string, debug?: boolean) => void;
   isDiagnosticsVisible: boolean;
   onToggleDiagnostics: () => void;
-  ttsStatus?: TTSStatus;
+  ttsStatus: TTSStatus;
   getPendingQuestion?: () => string | undefined;
   onFrameCaptured?: (base64Frame: string) => void;
   waitingForNote?: string | null;
@@ -94,8 +96,7 @@ const getBackendStatusMeta = (status: BackendStatus): StatusMeta => {
   }
 };
 
-const getTTSStatusMeta = (tts?: TTSStatus): StatusMeta => {
-  if (!tts) return { label: "TTS Disabled", color: "#64748B", bg: "#F1F5F9" };
+const getTTSStatusMeta = (tts: TTSStatus): StatusMeta => {
   if (tts.error) return { label: "TTS Error", color: "#B91C1C", bg: "#FEE2E2" };
   if (tts.isInitializing) return { label: "TTS Loading", color: "#B45309", bg: "#FEF3C7" };
   if (tts.isSpeaking) return { label: "Speaking", color: "#047857", bg: "#D1FAE5" };
@@ -106,6 +107,19 @@ const getTTSStatusMeta = (tts?: TTSStatus): StatusMeta => {
 const formatHeadingValue = (value?: number | null) => {
   if (typeof value !== "number" || Number.isNaN(value)) return "—";
   return `${value.toFixed(1)}°`;
+};
+
+const formatTimestamp = (value: number | null) => {
+  if (!value) return "—";
+  return new Date(value).toLocaleString();
+};
+
+const formatHeadingError = (error: unknown) => {
+  if (typeof error === "string") return error;
+  if (error && typeof error === "object" && "message" in error) {
+    return String((error as { message?: unknown }).message ?? "Heading error");
+  }
+  return "Heading error";
 };
 
 const getCardinalDirection = (heading: number) => {
@@ -198,7 +212,7 @@ export const AudioStreamView = ({
           },
           (error) => {
             if (!isActive) return;
-            setHeadingError(error?.message ?? "Heading error");
+            setHeadingError(formatHeadingError(error));
           },
         );
       } catch (error) {
@@ -512,6 +526,13 @@ export const AudioStreamView = ({
 								</Text>
 								<Text style={styles.helper}>
 									Deepgram error: {state.deepgramError ?? "None"}
+								</Text>
+								<Text style={styles.label}>Current speech</Text>
+								<Text style={styles.transcriptText}>
+									{ttsStatus.lastSpokenText ?? "No speech yet."}
+								</Text>
+								<Text style={styles.helper}>
+									Last spoken at: {formatTimestamp(ttsStatus.lastSpokenAt)}
 								</Text>
 							</View>
 

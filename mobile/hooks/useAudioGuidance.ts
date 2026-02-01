@@ -30,12 +30,19 @@ export function useAudioGuidance({ onTextToken, enabled = true }: UseAudioGuidan
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [isReady, setIsReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [lastSpokenText, setLastSpokenText] = useState<string | null>(null);
+  const [lastSpokenAt, setLastSpokenAt] = useState<number | null>(null);
 
   const textBuffer = useTextBuffer();
   const speechQueueRef = useRef<QueuedSentence[]>([]);
   const isPlayingRef = useRef(false);
   const callbackRegisteredRef = useRef(false);
   const lastStopAtRef = useRef<number | null>(null);
+  const lastSpokenTextRef = useRef<string | null>(null);
+  const lastSpokenAtRef = useRef<number | null>(null);
+  const currentSpeechTextRef = useRef<string | null>(null);
+  const currentSpeechStartedAtRef = useRef<number | null>(null);
+  const REPEAT_WINDOW_MS = 5000;
 
   // Initialize - configure audio mode and check if speech is available
   useEffect(() => {
@@ -109,6 +116,12 @@ export function useAudioGuidance({ onTextToken, enabled = true }: UseAudioGuidan
 
     isPlayingRef.current = true;
     setIsSpeaking(true);
+    currentSpeechTextRef.current = cleanedText;
+    currentSpeechStartedAtRef.current = Date.now();
+    lastSpokenTextRef.current = cleanedText;
+    lastSpokenAtRef.current = currentSpeechStartedAtRef.current;
+    setLastSpokenText(cleanedText);
+    setLastSpokenAt(currentSpeechStartedAtRef.current);
 
     console.log(`[AudioGuidance] Speaking: "${cleanedText}"`);
 
@@ -120,12 +133,16 @@ export function useAudioGuidance({ onTextToken, enabled = true }: UseAudioGuidan
         console.log('[AudioGuidance] Speech finished');
         isPlayingRef.current = false;
         setIsSpeaking(false);
+        currentSpeechTextRef.current = null;
+        currentSpeechStartedAtRef.current = null;
         playNextInQueue();
       },
       onError: (err) => {
         console.error('[AudioGuidance] Speech error:', err);
         isPlayingRef.current = false;
         setIsSpeaking(false);
+        currentSpeechTextRef.current = null;
+        currentSpeechStartedAtRef.current = null;
         playNextInQueue();
       },
     });
@@ -137,6 +154,8 @@ export function useAudioGuidance({ onTextToken, enabled = true }: UseAudioGuidan
     speechQueueRef.current = [];
     textBuffer.reset();
     setIsSpeaking(false);
+    currentSpeechTextRef.current = null;
+    currentSpeechStartedAtRef.current = null;
   }, [textBuffer]);
 
   // Handle complete sentences
@@ -147,9 +166,11 @@ export function useAudioGuidance({ onTextToken, enabled = true }: UseAudioGuidan
     textBuffer.onSentence(({ sentence, emergency }) => {
       console.log(`[AudioGuidance] Sentence received: "${sentence}" (emergency: ${emergency})`);
 
+      const now = Date.now();
+      let cleanedSentence = sentence.trim();
+
       const normalized = sentence.trim().toUpperCase();
       if (normalized.startsWith('STOP')) {
-        const now = Date.now();
         const lastStopAt = lastStopAtRef.current;
         if (lastStopAt && now - lastStopAt < 2000) {
           console.log('[AudioGuidance] Suppressing repeated STOP within 2s');
@@ -158,7 +179,45 @@ export function useAudioGuidance({ onTextToken, enabled = true }: UseAudioGuidan
         lastStopAtRef.current = now;
       }
 
-      const queuedSentence: QueuedSentence = { text: sentence, emergency };
+      const stripRepeatedPrefix = (text: string, prefix: string): string | null => {
+        const trimmedText = text.trim();
+        const trimmedPrefix = prefix.trim();
+        if (!trimmedText || !trimmedPrefix) return null;
+        if (trimmedText.toLowerCase().startsWith(trimmedPrefix.toLowerCase())) {
+          const remainder = trimmedText.slice(trimmedPrefix.length).replace(/^[\s,.;:!?\-–]+/, "").trim();
+          return remainder;
+        }
+        return null;
+      };
+
+      const currentSpeech = currentSpeechTextRef.current;
+      const currentSpeechAt = currentSpeechStartedAtRef.current;
+      const lastSpoken = lastSpokenTextRef.current;
+      const lastSpokenAtValue = lastSpokenAtRef.current;
+      const recentSpeech =
+        currentSpeech && currentSpeechAt && now - currentSpeechAt <= REPEAT_WINDOW_MS
+          ? currentSpeech
+          : lastSpoken && lastSpokenAtValue && now - lastSpokenAtValue <= REPEAT_WINDOW_MS
+            ? lastSpoken
+            : null;
+
+      if (recentSpeech) {
+        const remainder = stripRepeatedPrefix(cleanedSentence, recentSpeech);
+        if (remainder !== null) {
+          if (!remainder) {
+            console.log('[AudioGuidance] Suppressing repeated sentence within 5s');
+            return;
+          }
+          if (isPlayingRef.current) {
+            speechQueueRef.current.push({ text: remainder, emergency });
+            console.log('[AudioGuidance] Appending new content after repeated prefix');
+            return;
+          }
+          cleanedSentence = remainder;
+        }
+      }
+
+      const queuedSentence: QueuedSentence = { text: cleanedSentence, emergency };
 
       // Always interrupt current speech to avoid backlog
       Speech.stop();
@@ -196,5 +255,7 @@ export function useAudioGuidance({ onTextToken, enabled = true }: UseAudioGuidan
     isInitializing: false, // No initialization needed for native TTS
     error,
     stopSpeaking,
+    lastSpokenText,
+    lastSpokenAt,
   };
 }

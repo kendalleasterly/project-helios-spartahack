@@ -35,7 +35,7 @@ You receive:
 3. Recent history (what you've said in the last 10 seconds)
 4. Motion/sensor telemetry (per-frame):
    - speed_mps, speed_avg_1s_mps, velocity_x_mps, velocity_z_mps
-   - heading_deg (absolute heading in degrees, true if available)
+   - heading_deg (absolute heading; use it to choose cardinal direction words)
    - steps_last_3s, steps_since_open, is_moving (if provided)
 
 Treat the user as MOVING if speed_mps ≥ 0.2 OR steps_last_3s ≥ 1 (or is_moving is true).
@@ -80,8 +80,9 @@ Respond with the spoken guidance only.
 - If navigation is active, provide a concise update about environment + next action at least every 10 seconds.
 - In discovery mode, keep prompting the user to change perspective until the goal is found or you have clearly searched the space.
 - If NAVIGATION STATE shows cue_due=true, provide an update now.
- - When giving direction or planning steps, include an absolute direction using heading_deg if available
-   (e.g., "Turn to 090° East", "Walk heading 315° NW"). Use plain N/NE/E/SE/S/SW/W/NW plus degrees.
+ - When giving direction or planning steps, use RELATIVE directions only.
+   Prefer: "walk forward", "turn left then walk forward", "veer right", "turn around".
+   Do NOT use absolute directions or degrees. Continue using relative cues like "turn right/left".
 
 ## KEY MINDSET
 
@@ -123,8 +124,9 @@ CRITICAL RULES:
 - Once the goal is found, create a plan (micro-steps if the path is only partially visible).
 - Plans must be very directional. Each step should include a direction like:
   "left", "right", "slight left", "slight right", "straight", "turn around".
-- When giving directions or plan steps, include absolute heading using heading_deg if available
-  (e.g., "Turn to 090° East", "Walk heading 315° NW"). Use plain N/NE/E/SE/S/SW/W/NW plus degrees.
+- When giving directions or plan steps, use RELATIVE directions only.
+  Prefer: "walk forward", "turn left then walk forward", "veer right", "turn around".
+  Do NOT use absolute directions or degrees. Continue using relative cues like "turn right/left".
 - While executing a plan, keep giving short safety cues and environment updates.
 - Keep responses concise, but allow extra words when giving step-by-step guidance.
 - If navigation is active, provide a concise update about environment + next action at least every 10 seconds.
@@ -648,9 +650,10 @@ class BlindAssistantService:
 
         # Persistent navigation state
         self.navigation_state = NavigationState()
-        self.navigation_cue_interval_s = 10.0
+        self.navigation_cue_interval_s = 7.5
         self.last_vision_urgency: Optional[UrgencyLevel] = None
         self.last_vision_reason: Optional[str] = None
+        self.last_vision_fast_path: bool = False
 
     _NAV_STATE_PATTERN = re.compile(r"<nav_state>(.*?)</nav_state>", re.IGNORECASE | re.DOTALL)
 
@@ -718,7 +721,7 @@ class BlindAssistantService:
             "objective": self.navigation_state.objective,
             "phase": self.navigation_state.phase,
             "plan": self.navigation_state.plan[:4],
-            "cue_every_s": int(self.navigation_cue_interval_s),
+            "cue_every_s": round(self.navigation_cue_interval_s, 1),
             "cue_due": self._navigation_cue_due(now),
             "objective_confirmed": self.navigation_state.objective_confirmed,
             "found_objective": self.navigation_state.objective_confirmed,
@@ -963,6 +966,7 @@ class BlindAssistantService:
         navigation_cue_due = self._navigation_cue_due(current_time)
         self.last_vision_urgency = None
         self.last_vision_reason = None
+        self.last_vision_fast_path = False
 
         def record_fast_path_response(raw_text: str, urgency: UrgencyLevel) -> str:
             response_text = raw_text
@@ -981,6 +985,7 @@ class BlindAssistantService:
             self.last_spoke_time = current_time
             self.last_vision_urgency = urgency
             self.last_vision_reason = raw_text
+            self.last_vision_fast_path = True
             if self.navigation_state.active:
                 if urgency in (UrgencyLevel.URGENT, UrgencyLevel.ALERT):
                     self._log_navigation_state("fast_path_alert")
@@ -1044,6 +1049,7 @@ class BlindAssistantService:
             self.last_spoke_time = current_time
             self.last_vision_urgency = UrgencyLevel.INFO
             self.last_vision_reason = "Navigation cue"
+            self.last_vision_fast_path = False
             if self.navigation_state.active:
                 self.navigation_state.last_cue_ts = current_time
                 self._log_navigation_state("vision_cue")
@@ -1244,9 +1250,16 @@ class BlindAssistantService:
         logger.info(f"✅ Got response | Should speak: {response.should_speak} | Length: {len(response.full_text)}")
 
         spoken_text, nav_update = self._extract_nav_state_block(response.full_text)
+        was_active = self.navigation_state.active
         if nav_update:
             self._apply_navigation_update(nav_update)
-        if spoken_text and self.navigation_state.active:
+
+        nav_started = (not was_active) and self.navigation_state.active
+        if nav_started:
+            # Force the first navigation cue to fire immediately on the next frame.
+            self.navigation_state.last_cue_ts = 0.0
+            self._log_navigation_state("nav_started")
+        elif spoken_text and self.navigation_state.active:
             self.navigation_state.last_cue_ts = time.time()
             self._log_navigation_state("conversation_cue")
         return spoken_text

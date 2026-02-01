@@ -135,7 +135,7 @@ export function useDeviceSensors({
     if (!enabled) return;
 
     let motionSubscription: ReturnType<typeof DeviceMotion.addListener> | null = null;
-    let throttleTimeout: NodeJS.Timeout | null = null;
+    let throttleTimeout: ReturnType<typeof setTimeout> | null = null;
 
     const startMotion = async () => {
       const { status } = await DeviceMotion.requestPermissionsAsync();

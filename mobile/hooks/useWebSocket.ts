@@ -75,6 +75,7 @@ export function useWebSocket(): UseWebSocketReturn {
   const socketRef = useRef<Socket | null>(null);
   const textTokenCallbackRef = useRef<TextTokenCallback | null>(null);
   const hapticCallbackRef = useRef<HapticCallback | null>(null);
+  const lastDeviceSensorRef = useRef<DeviceSensorPayload | null>(null);
 
   const connect = useCallback(() => {
     if (socketRef.current?.connected) {
@@ -187,15 +188,23 @@ export function useWebSocket(): UseWebSocketReturn {
 
   const sendFrame = useCallback((base64Frame: string, userQuestion?: string, debug = false) => {
     if (socketRef.current?.connected) {
-      socketRef.current.emit("video_frame_streaming", {
+      const hasQuestion = typeof userQuestion === "string" && userQuestion.trim().length > 0;
+      const payload: Record<string, unknown> = {
         frame: base64Frame,
         user_question: userQuestion,
         debug,
-      });
+      };
+
+      if (hasQuestion && lastDeviceSensorRef.current) {
+        payload.device_sensors = lastDeviceSensorRef.current;
+      }
+
+      socketRef.current.emit("video_frame_streaming", payload);
     }
   }, []);
 
   const sendDeviceSensors = useCallback((payload: DeviceSensorPayload) => {
+    lastDeviceSensorRef.current = payload;
     if (socketRef.current?.connected) {
       socketRef.current.emit("device_sensor_stream", payload);
     }

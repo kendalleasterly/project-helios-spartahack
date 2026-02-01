@@ -113,21 +113,41 @@ def evaluate_scene(
     steps = motion.get("steps_last_3s", 0) or 0
     is_moving = speed > 0.1 or steps > 0
     
+    def get_distance_category(distance_value: Optional[str]) -> str:
+        if not distance_value:
+            return ""
+        if isinstance(distance_value, str):
+            return distance_value.split()[0].lower()
+        return str(distance_value).split()[0].lower()
+
     # 2. Check for DANGEROUS objects in the path
     # Must be in the oval ("path") AND be in our specific warning list
     path_objects = [
         o for o in objects
-        if o.get("position") == "path" 
+        if o.get("position") == "path"
         and o.get("label") in WARNING_TRIGGER_LABELS
+        and get_distance_category(o.get("distance")) in {"immediate", "close", "medium"}
     ]
     
     # 3. Trigger only if BOTH are true
     if is_moving and path_objects:
         labels = [o.get("label", "object") for o in path_objects]
+        distance_categories = [
+            get_distance_category(o.get("distance")) for o in path_objects
+        ]
+        if "immediate" in distance_categories:
+            urgency = UrgencyLevel.URGENT
+            reason = f"STOP: {', '.join(labels)} ahead (immediate)"
+        elif "close" in distance_categories:
+            urgency = UrgencyLevel.ALERT
+            reason = f"STOP: {', '.join(labels)} ahead (close)"
+        else:
+            urgency = UrgencyLevel.GUIDANCE
+            reason = f"Obstacle ahead: {', '.join(labels)}"
         return SpeakDecision(
             should_speak=True,
-            urgency=UrgencyLevel.URGENT,
-            reason=f"STOP: {', '.join(labels)} ahead"
+            urgency=urgency,
+            reason=reason
         )
 
     # Otherwise silent

@@ -471,6 +471,7 @@ async def video_frame_streaming(sid, data):
         base64_frame = data['frame']
         user_question = data.get('user_question')
         debug_mode = data.get('debug', False)
+        device_sensors = data.get('device_sensors')
 
         image = decode_base64_image(base64_frame)
         h, w = image.shape[:2]
@@ -497,6 +498,17 @@ async def video_frame_streaming(sid, data):
         det = process_detections(results, h, w)
         objects, clusters, emergency_stop = det['objects'], det['clusters'], det['emergency_stop']
         summary = generate_summary(objects, clusters)
+
+        if isinstance(device_sensors, dict):
+            device_sensor_cache[sid] = {
+                "speed_mps": device_sensors.get("speed_mps"),
+                "speed_avg_1s_mps": device_sensors.get("speed_avg_1s_mps"),
+                "velocity_x_mps": device_sensors.get("velocity_x_mps"),
+                "velocity_z_mps": device_sensors.get("velocity_z_mps"),
+                "heading_deg": device_sensors.get("heading_deg"),
+                "steps_last_3s": device_sensors.get("steps_last_3s"),
+                "steps_since_open": device_sensors.get("steps_since_open"),
+            }
 
         sensor = device_sensor_cache.get(sid, {})
         speed = sensor.get("speed_mps")
@@ -556,7 +568,24 @@ async def video_frame_streaming(sid, data):
             if resp:
                 nav_active = bool(getattr(assistant, "navigation_state", None) and assistant.navigation_state.active)
                 last_urgency = getattr(assistant, "last_vision_urgency", None)
-                if nav_active and last_urgency in (UrgencyLevel.URGENT, UrgencyLevel.ALERT):
+                last_fast_path = bool(getattr(assistant, "last_vision_fast_path", False))
+                is_stop_alert = isinstance(resp, str) and resp.lstrip().upper().startswith("STOP")
+                if last_fast_path:
+                    if last_urgency in (UrgencyLevel.URGENT, UrgencyLevel.ALERT):
+                        pattern = "burst"
+                    elif last_urgency == UrgencyLevel.GUIDANCE:
+                        pattern = "warning"
+                    else:
+                        pattern = "heavy"
+                    await sio.emit(
+                        'haptic',
+                        {
+                            'pattern': pattern,
+                            'reason': getattr(assistant, "last_vision_reason", "") or "",
+                        },
+                        room=sid
+                    )
+                elif nav_active and (last_urgency in (UrgencyLevel.URGENT, UrgencyLevel.ALERT) or is_stop_alert):
                     await sio.emit(
                         'haptic',
                         {
@@ -565,7 +594,8 @@ async def video_frame_streaming(sid, data):
                         },
                         room=sid
                     )
-                await sio.emit('text_response', {'text': resp, 'mode': 'vision', 'emergency': "STOP" in resp}, room=sid)
+                else:
+                    await sio.emit('text_response', {'text': resp, 'mode': 'vision', 'emergency': "STOP" in resp}, room=sid)
 
                 # Save debug frame ONLY if a warning/response was triggered
                 if SAVE_DEBUG_FRAMES:

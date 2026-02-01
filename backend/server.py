@@ -616,12 +616,6 @@ async def video_frame_streaming(sid, data):
                 f"YOLO: {inference_ms:.0f}ms | Objects: {len(objects)} | "
                 f"Emergency: {emergency_stop}"
             )
-=======
-        if debug_mode:
-            ann = annotate_frame(image, objects, emergency_stop)
-            _, buf = cv2.imencode('.jpg', ann)
-            await sio.emit('debug_frame', {'frame': f"data:image/jpeg;base64,{base64.b64encode(buf).decode()}", 'summary': summary, 'mode': 'vision'}, room=sid)
->>>>>>> feature/navigation
 
     except Exception as e:
         logger.error(f"Error: {e}")

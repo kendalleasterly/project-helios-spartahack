@@ -86,6 +86,9 @@ DEVICE_STREAM_LOG_MAX_CHARS = int(os.getenv('DEVICE_STREAM_LOG_MAX_CHARS', '1200
 # Track device stream message counts per socket
 device_stream_counts: Dict[str, int] = {}
 
+# Store latest sensor data per socket (for motion-aware heuristics)
+device_sensor_cache: Dict[str, Dict[str, Any]] = {}
+
 
 def _select_torch_device() -> str:
     """Select the best available torch device (CUDA > MPS > CPU)."""
@@ -1155,6 +1158,7 @@ async def disconnect(sid):
     """Handle client disconnection."""
     logger.info(f"✗ Client disconnected: {sid}")
     device_stream_counts.pop(sid, None)
+    device_sensor_cache.pop(sid, None)
 
 
 @sio.event
@@ -1200,6 +1204,9 @@ async def device_sensor_stream(sid, data):
             "steps_last_3s": None,
             "steps_since_open": None,
         }
+
+    # Cache latest sensor data for motion-aware heuristics
+    device_sensor_cache[sid] = payload
 
     payload_preview = _format_device_stream_payload(payload, DEVICE_STREAM_LOG_MAX_CHARS)
     logger.info(f"📱 Device stream [{sid}] #{device_stream_counts[sid]}: {payload_preview}")
@@ -1290,12 +1297,33 @@ async def video_frame_streaming(sid, data):
         # Step 4: Generate summary
         summary = generate_summary(objects, clusters)
 
-        # Step 5: Build YOLO results dict
+        # Step 5: Build YOLO results dict with motion data from sensors
+        # Get latest sensor data for this socket (if available)
+        sensor_data = device_sensor_cache.get(sid, {})
+        speed_mps = sensor_data.get("speed_mps")
+        steps_last_3s = sensor_data.get("steps_last_3s")
+
+        # Derive is_moving from speed or steps
+        # Walking speed ~1.2 m/s, threshold at 0.2 m/s to catch slow movement
+        is_moving = True  # Default to moving (safer - will speak more)
+        if speed_mps is not None:
+            is_moving = speed_mps > 0.2
+        elif steps_last_3s is not None:
+            is_moving = steps_last_3s > 0
+
         yolo_results = {
             "summary": summary,
             "objects": objects,
-            "emergency_stop": emergency_stop
+            "emergency_stop": emergency_stop,
+            "motion": {
+                "is_moving": is_moving,
+                "speed": speed_mps,
+                "steps_recent": steps_last_3s
+            }
         }
+
+        if not is_moving:
+            logger.info(f"🧍 User STATIONARY | speed={speed_mps} m/s | steps_3s={steps_last_3s}")
 
         # Step 6: Route to appropriate pipeline
         if not assistant:

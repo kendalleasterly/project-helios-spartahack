@@ -1,4 +1,4 @@
-# Project Helios (a-eye)
+# Project Helios 
 
 > **An AI-powered assistive navigation system for blind users using computer vision, real-time object detection, and conversational AI.**
 

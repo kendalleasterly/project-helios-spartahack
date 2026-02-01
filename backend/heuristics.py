@@ -3,6 +3,9 @@ Heuristics Engine for Project Helios v2
 
 Decides WHEN to call Gemini based on YOLO detection data.
 Gemini then decides WHAT to say.
+
+Motion-aware: When user is stationary, only speaks for emergencies,
+approaching objects, or genuinely new information.
 """
 
 from dataclasses import dataclass, field
@@ -35,6 +38,10 @@ class HeuristicsConfig:
 
     # Debounce: minimum seconds between any non-urgent speech
     min_speech_interval_seconds: float = 2.0  # Don't speak more than once per 2s
+
+    # Motion: When stationary, be much quieter (only emergencies/approaching)
+    stationary_info_debounce_seconds: float = 30.0  # Rarely speak when still
+    stationary_skip_path_hazards: bool = True  # Don't warn about static obstacles
 
     # Objects that warrant proactive speaking (reduced set - only real hazards/goals)
     important_objects: Set[str] = field(default_factory=lambda: {
@@ -95,7 +102,12 @@ def evaluate_scene(
         scene_analysis: YOLO detection results with structure:
             {
                 "objects": [{"label": str, "distance": str, "position": str}, ...],
-                "emergency_stop": bool
+                "emergency_stop": bool,
+                "motion": {
+                    "is_moving": bool,      # From step detector/accelerometer
+                    "speed": float | None,  # Meters per second (optional)
+                    "steps_recent": int     # Steps in last 3-5 seconds (optional)
+                }
             }
         recent_objects: Object labels seen in last N seconds (for debouncing)
         last_spoke_seconds_ago: Time since last speech output
@@ -109,6 +121,10 @@ def evaluate_scene(
 
     objects = scene_analysis.get("objects", [])
     emergency = scene_analysis.get("emergency_stop", False)
+
+    # Motion awareness: default to moving (safer - will speak more)
+    motion = scene_analysis.get("motion", {})
+    is_moving = motion.get("is_moving", True)
 
     # URGENT: Emergency flag - highest priority (always speaks immediately)
     if emergency:
@@ -146,22 +162,30 @@ def evaluate_scene(
         )
 
     # GUIDANCE: Close HAZARDS in walking path (not just any object)
-    close_hazards_in_path = [
-        o for o in objects
-        if o.get("distance") == "close"
-        and any(p in o.get("position", "") for p in config.path_positions)
-        and o.get("label") in config.path_hazards
-    ]
-    if close_hazards_in_path:
-        labels = [o.get("label", "object") for o in close_hazards_in_path]
-        return SpeakDecision(
-            should_speak=True,
-            urgency=UrgencyLevel.GUIDANCE,
-            reason=f"In path: {', '.join(labels)}"
-        )
+    # Skip when stationary - user isn't walking into static obstacles
+    if is_moving or not config.stationary_skip_path_hazards:
+        close_hazards_in_path = [
+            o for o in objects
+            if o.get("distance") == "close"
+            and any(p in o.get("position", "") for p in config.path_positions)
+            and o.get("label") in config.path_hazards
+        ]
+        if close_hazards_in_path:
+            labels = [o.get("label", "object") for o in close_hazards_in_path]
+            return SpeakDecision(
+                should_speak=True,
+                urgency=UrgencyLevel.GUIDANCE,
+                reason=f"In path: {', '.join(labels)}"
+            )
 
     # INFO: New important objects (debounced heavily to avoid spam)
-    if last_spoke_seconds_ago > config.info_debounce_seconds:
+    # Use longer debounce when stationary
+    info_debounce = (
+        config.stationary_info_debounce_seconds
+        if not is_moving
+        else config.info_debounce_seconds
+    )
+    if last_spoke_seconds_ago > info_debounce:
         current_labels = {o.get("label") for o in objects if o.get("label")}
         new_important = (current_labels & config.important_objects) - recent_objects
 

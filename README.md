@@ -226,7 +226,7 @@ npm run build:dev
 
 ## 🤝 Contributing
 
-This project was developed for SpartaHack 9. Contributions are welcome!
+This project was developed for SpartaHack 11. Contributions are welcome!
 
 1. Fork the repository
 2. Create a feature branch: `git checkout -b feature-name`
@@ -240,7 +240,7 @@ MIT License - See individual component documentation for details.
 
 ## 🙏 Acknowledgments
 
-- **SpartaHack 9**: For providing the opportunity to build this project
+- **SpartaHack 11**: For providing the opportunity to build this project
 - **Ultralytics**: For the YOLO11 object detection model
 - **Google**: For Gemini AI API access
 - **Expo Team**: For excellent React Native tooling

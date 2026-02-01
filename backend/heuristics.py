@@ -31,20 +31,26 @@ class SpeakDecision:
 class HeuristicsConfig:
     """Tunable parameters for the heuristics engine."""
     # Debounce: minimum seconds between INFO-level speech
-    info_debounce_seconds: float = 3.0
+    info_debounce_seconds: float = 10.0  # Was 3.0 - increased to reduce chatter
 
-    # Objects that warrant proactive speaking
+    # Debounce: minimum seconds between any non-urgent speech
+    min_speech_interval_seconds: float = 2.0  # Don't speak more than once per 2s
+
+    # Objects that warrant proactive speaking (reduced set - only real hazards/goals)
     important_objects: Set[str] = field(default_factory=lambda: {
-        # Navigation
-        "door", "stairs", "elevator", "escalator",
-        # Seating
-        "chair", "couch", "bench", "sofa",
-        # Safety
-        "car", "truck", "bus", "motorcycle", "bicycle",
-        # People
+        # Navigation landmarks
+        "door", "stairs", "elevator",
+        # Vehicles (safety critical)
+        "car", "truck", "bus", "motorcycle",
+        # People (social awareness)
         "person",
-        # Hazards
-        "dog", "cat",
+    })
+
+    # Objects that are hazards when in path (triggers GUIDANCE)
+    path_hazards: Set[str] = field(default_factory=lambda: {
+        "chair", "table", "bench", "couch", "sofa",
+        "bicycle", "dog", "cat",
+        "suitcase", "backpack", "box",
     })
 
     # Positions considered "in walking path"
@@ -59,16 +65,18 @@ class HeuristicsConfig:
 
 # Default sets for use without config
 IMPORTANT_OBJECTS: Set[str] = {
-    # Navigation
-    "door", "stairs", "elevator", "escalator",
-    # Seating
-    "chair", "couch", "bench", "sofa",
-    # Safety
-    "car", "truck", "bus", "motorcycle", "bicycle",
-    # People
+    # Navigation landmarks
+    "door", "stairs", "elevator",
+    # Vehicles (safety critical)
+    "car", "truck", "bus", "motorcycle",
+    # People (social awareness)
     "person",
-    # Hazards
-    "dog", "cat",
+}
+
+PATH_HAZARDS: Set[str] = {
+    "chair", "table", "bench", "couch", "sofa",
+    "bicycle", "dog", "cat",
+    "suitcase", "backpack", "box",
 }
 
 PATH_POSITIONS: Set[str] = {"center", "mid-center", "bottom-center"}
@@ -102,7 +110,7 @@ def evaluate_scene(
     objects = scene_analysis.get("objects", [])
     emergency = scene_analysis.get("emergency_stop", False)
 
-    # URGENT: Emergency flag - highest priority
+    # URGENT: Emergency flag - highest priority (always speaks immediately)
     if emergency:
         return SpeakDecision(
             should_speak=True,
@@ -111,30 +119,48 @@ def evaluate_scene(
         )
 
     # ALERT: Immediate distance (< 3 feet) - very high priority
+    # Only for actual hazards, not every object
     immediate_objects = [o for o in objects if o.get("distance") == "immediate"]
     if immediate_objects:
-        labels = [o.get("label", "object") for o in immediate_objects]
+        # Filter to only hazardous immediate objects
+        hazardous_immediate = [
+            o for o in immediate_objects
+            if o.get("label") in config.important_objects
+            or o.get("label") in config.path_hazards
+            or o.get("label") in {"wall", "pole", "pillar", "obstacle"}
+        ]
+        if hazardous_immediate:
+            labels = [o.get("label", "object") for o in hazardous_immediate]
+            return SpeakDecision(
+                should_speak=True,
+                urgency=UrgencyLevel.ALERT,
+                reason=f"Immediate: {', '.join(labels)}"
+            )
+
+    # Global debounce: don't speak too frequently (except URGENT)
+    if last_spoke_seconds_ago < config.min_speech_interval_seconds:
         return SpeakDecision(
-            should_speak=True,
-            urgency=UrgencyLevel.ALERT,
-            reason=f"Immediate: {', '.join(labels)}"
+            should_speak=False,
+            urgency=UrgencyLevel.SILENT,
+            reason="Clear path, no changes"
         )
 
-    # GUIDANCE: Close objects in walking path
-    close_in_path = [
+    # GUIDANCE: Close HAZARDS in walking path (not just any object)
+    close_hazards_in_path = [
         o for o in objects
         if o.get("distance") == "close"
         and any(p in o.get("position", "") for p in config.path_positions)
+        and o.get("label") in config.path_hazards
     ]
-    if close_in_path:
-        labels = [o.get("label", "object") for o in close_in_path]
+    if close_hazards_in_path:
+        labels = [o.get("label", "object") for o in close_hazards_in_path]
         return SpeakDecision(
             should_speak=True,
             urgency=UrgencyLevel.GUIDANCE,
             reason=f"In path: {', '.join(labels)}"
         )
 
-    # INFO: New important objects (debounced to avoid spam)
+    # INFO: New important objects (debounced heavily to avoid spam)
     if last_spoke_seconds_ago > config.info_debounce_seconds:
         current_labels = {o.get("label") for o in objects if o.get("label")}
         new_important = (current_labels & config.important_objects) - recent_objects

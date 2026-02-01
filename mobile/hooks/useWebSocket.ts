@@ -93,7 +93,7 @@ export function useWebSocket(): UseWebSocketReturn {
 
   const sendFrame = useCallback((base64Frame: string, debug = false) => {
     if (socketRef.current?.connected) {
-      socketRef.current.emit("video_frame", {
+      socketRef.current.emit("video_frame_streaming", {
         frame: base64Frame,
         debug,
       });

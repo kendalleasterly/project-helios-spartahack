@@ -3,11 +3,18 @@ import { AudioStreamView } from "@/components/AudioStreamView";
 import { useAudioStreamViewModel } from "@/components/AudioStreamViewModel";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { useAudioGuidance } from "@/hooks/useAudioGuidance";
+import { useWakeWord } from "@/hooks/useWakeWord";
 
 export function MicStreamTest() {
   const { state, actions } = useAudioStreamViewModel();
   const { status: backendStatus, sendFrame, connect, onTextToken } = useWebSocket();
   const [isDiagnosticsVisible, setIsDiagnosticsVisible] = useState(false);
+
+  // Wake word detection - monitors transcripts for "Helios"
+  const { consumePendingQuestion } = useWakeWord({
+    partialTranscript: state.partialTranscript,
+    finalTranscripts: state.finalTranscripts,
+  });
 
   // Initialize audio guidance (TTS)
   const { isSpeaking, isReady, isInitializing, error: ttsError } = useAudioGuidance({
@@ -41,6 +48,7 @@ export function MicStreamTest() {
       onSendFrame={sendFrame}
       isDiagnosticsVisible={isDiagnosticsVisible}
       onToggleDiagnostics={handleToggleDiagnostics}
+      getPendingQuestion={consumePendingQuestion}
       ttsStatus={{
         isSpeaking,
         isReady,

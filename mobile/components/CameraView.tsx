@@ -12,10 +12,11 @@ const TARGET_WIDTH = 720;  // 720p for portrait mode (720x1280 after rotation)
 const TARGET_HEIGHT = 1280;
 
 type CameraViewProps = {
-  onFrame: (base64Frame: string, debug?: boolean) => void;
+  onFrame: (base64Frame: string, userQuestion?: string, debug?: boolean) => void;
+  getPendingQuestion?: () => string | undefined;
 };
 
-export default function CameraView({ onFrame }: CameraViewProps) {
+export default function CameraView({ onFrame, getPendingQuestion }: CameraViewProps) {
   const { hasPermission, requestPermission } = useCameraPermission();
   const [isActive, setIsActive] = useState(false);
   const device = useCameraDevice("back");
@@ -45,18 +46,28 @@ export default function CameraView({ onFrame }: CameraViewProps) {
       reader.onloadend = () => {
         const base64 = reader.result as string;
         const base64Data = base64.split(",")[1];
-        console.log(
-          `Frame captured: ${photo.width}x${photo.height} → ${resized.width}x${resized.height}, base64 length: ${base64Data.length}`,
-        );
+        
+        // Check for pending question from wake word detection
+        const pendingQuestion = getPendingQuestion?.();
+        
+        if (pendingQuestion) {
+          console.log(
+            `Frame captured with question: ${photo.width}x${photo.height} → ${resized.width}x${resized.height}, question: "${pendingQuestion}"`,
+          );
+        } else {
+          console.log(
+            `Frame captured: ${photo.width}x${photo.height} → ${resized.width}x${resized.height}, base64 length: ${base64Data.length}`,
+          );
+        }
 
-        onFrame(base64Data);
+        onFrame(base64Data, pendingQuestion);
       };
 
       reader.readAsDataURL(blob);
     } catch (error) {
       console.error("Error capturing frame:", error);
     }
-  }, [onFrame]);
+  }, [onFrame, getPendingQuestion]);
 
   useEffect(() => {
     if (hasPermission === false) {

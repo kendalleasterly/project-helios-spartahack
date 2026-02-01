@@ -29,7 +29,7 @@ export type TextTokenCallback = (event: TextTokenEvent) => void;
 interface UseWebSocketReturn {
   socket: Socket | null;
   status: ConnectionStatus;
-  sendFrame: (base64Frame: string, debug?: boolean) => void;
+  sendFrame: (base64Frame: string, userQuestion?: string, debug?: boolean) => void;
   onTextToken: (callback: TextTokenCallback) => void;
   connect: () => void;
   disconnect: () => void;
@@ -135,11 +135,16 @@ export function useWebSocket(): UseWebSocketReturn {
     }
   }, []);
 
-  const sendFrame = useCallback((base64Frame: string, debug = false) => {
+  const sendFrame = useCallback((base64Frame: string, userQuestion?: string, debug = false) => {
     if (socketRef.current?.connected) {
-      console.log(`Sending frame to backend (${base64Frame.length} bytes)`);
+      if (userQuestion) {
+        console.log(`Sending frame with question to backend: "${userQuestion}"`);
+      } else {
+        console.log(`Sending frame to backend (${base64Frame.length} bytes)`);
+      }
       socketRef.current.emit("video_frame_streaming", {
         frame: base64Frame,
+        user_question: userQuestion,
         debug,
       });
     } else {

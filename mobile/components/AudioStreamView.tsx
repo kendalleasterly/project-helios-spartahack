@@ -33,10 +33,11 @@ type AudioStreamViewProps = {
   state: AudioStreamViewState;
   actions: AudioStreamViewActions;
   backendStatus: BackendStatus;
-  onSendFrame: (base64Frame: string, debug?: boolean) => void;
+  onSendFrame: (base64Frame: string, userQuestion?: string, debug?: boolean) => void;
   isDiagnosticsVisible: boolean;
   onToggleDiagnostics: () => void;
   ttsStatus?: TTSStatus;
+  getPendingQuestion?: () => string | undefined;
 };
 
 const getMicStatusMeta = (status: StreamStatus): StatusMeta => {
@@ -100,6 +101,7 @@ export const AudioStreamView = ({
   isDiagnosticsVisible,
   onToggleDiagnostics,
   ttsStatus,
+  getPendingQuestion,
 }: AudioStreamViewProps) => {
   const micStatusMeta = getMicStatusMeta(state.status);
   const deepgramStatusMeta = getDeepgramStatusMeta(state.deepgramStatus);
@@ -113,7 +115,7 @@ export const AudioStreamView = ({
   return (
     <SafeAreaView style={styles.screen}>
       <View style={styles.cameraLayer}>
-        <CameraView onFrame={onSendFrame} />
+        <CameraView onFrame={onSendFrame} getPendingQuestion={getPendingQuestion} />
       </View>
       <View style={styles.overlay} pointerEvents="box-none">
         <View style={styles.statusRow}>

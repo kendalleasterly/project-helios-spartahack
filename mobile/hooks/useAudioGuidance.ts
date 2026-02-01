@@ -34,6 +34,7 @@ export function useAudioGuidance({ onTextToken, enabled = true }: UseAudioGuidan
   const speechQueueRef = useRef<QueuedSentence[]>([]);
   const isPlayingRef = useRef(false);
   const callbackRegisteredRef = useRef(false);
+  const lastStopAtRef = useRef<number | null>(null);
 
   // Initialize - configure audio mode and check if speech is available
   useEffect(() => {
@@ -118,6 +119,17 @@ export function useAudioGuidance({ onTextToken, enabled = true }: UseAudioGuidan
     console.log('[AudioGuidance] Registering sentence callback');
     textBuffer.onSentence(({ sentence, emergency }) => {
       console.log(`[AudioGuidance] Sentence received: "${sentence}" (emergency: ${emergency})`);
+
+      const normalized = sentence.trim().replace(/[.!?]+$/, '').toUpperCase();
+      if (normalized === 'STOP') {
+        const now = Date.now();
+        const lastStopAt = lastStopAtRef.current;
+        if (lastStopAt && now - lastStopAt < 3000) {
+          console.log('[AudioGuidance] Suppressing repeated STOP within 3s');
+          return;
+        }
+        lastStopAtRef.current = now;
+      }
 
       const queuedSentence: QueuedSentence = { text: sentence, emergency };
 

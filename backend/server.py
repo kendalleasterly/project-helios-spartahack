@@ -36,8 +36,8 @@ load_dotenv()
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,  # Back to INFO now that we've diagnosed the issue
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    level=logging.CRITICAL,
+    format='%(message)s'
 )
 logger = logging.getLogger(__name__)
 
@@ -1169,6 +1169,7 @@ async def device_sensor_stream(sid, data):
     Expected data:
     {
         "speed_mps": 0.12,
+        "speed_avg_1s_mps": 0.11,
         "velocity_x_mps": 0.03,
         "velocity_z_mps": -0.08,
         "magnetic_x_ut": 12.3,
@@ -1181,6 +1182,7 @@ async def device_sensor_stream(sid, data):
     if isinstance(data, dict):
         payload = {
             "speed_mps": data.get("speed_mps", data.get("speed")),
+            "speed_avg_1s_mps": data.get("speed_avg_1s_mps", data.get("speed_mps")),
             "velocity_x_mps": data.get("velocity_x_mps", data.get("dx")),
             "velocity_z_mps": data.get("velocity_z_mps", data.get("dz")),
             "magnetic_x_ut": data.get(
@@ -1197,6 +1199,7 @@ async def device_sensor_stream(sid, data):
     else:
         payload = {
             "speed_mps": None,
+            "speed_avg_1s_mps": None,
             "velocity_x_mps": None,
             "velocity_z_mps": None,
             "magnetic_x_ut": None,
@@ -1280,6 +1283,56 @@ async def video_frame_streaming(sid, data):
         clusters = detection_data['clusters']
         emergency_stop = detection_data['emergency_stop']
 
+        # Motion-aware immediate stop: if moving and obstacle is close in path, bypass Gemini
+        sensor_data = device_sensor_cache.get(sid, {})
+        speed_mps = sensor_data.get("speed_mps")
+        steps_last_3s = sensor_data.get("steps_last_3s")
+        print(
+            f"🚦 speed_mps={speed_mps} speed_avg_1s_mps={sensor_data.get('speed_avg_1s_mps')} "
+            f"steps_last_3s={steps_last_3s}"
+        )
+        if objects:
+            object_summaries = []
+            for obj in objects:
+                label = obj.get("label", "object")
+                distance = obj.get("distance", "unknown")
+                position = obj.get("position", "unknown")
+                object_summaries.append(f"{label} | {distance} | {position}")
+            print(f"🧱 objects: {', '.join(object_summaries)}")
+        else:
+            print("🧱 objects: none")
+
+        speed_avg_1s_mps = sensor_data.get("speed_avg_1s_mps")
+        is_moving_fast = False
+        if speed_avg_1s_mps is not None:
+            is_moving_fast = speed_avg_1s_mps >= 0.3
+        elif speed_mps is not None:
+            is_moving_fast = speed_mps >= 0.3
+        elif steps_last_3s is not None:
+            is_moving_fast = steps_last_3s > 0
+
+        close_in_path = [
+            obj for obj in objects
+            if (
+                ("immediate" in (obj.get("distance") or ""))
+                or ("close" in (obj.get("distance") or ""))
+            )
+            and "center" in (obj.get("position") or "")
+        ]
+        if is_moving_fast and close_in_path:
+            labels = [obj.get("label", "object") for obj in close_in_path[:3]]
+            print(f"🛑 Immediate STOP | speed={speed_mps} m/s | hazards={labels}")
+            await sio.emit(
+                'text_response',
+                {
+                    'text': 'STOP',
+                    'mode': 'vision',
+                    'emergency': True
+                },
+                room=sid
+            )
+            return
+
         # Log detected objects with distances for testing/debugging
         if objects:
             logger.info(f"📦 Detected {len(objects)} objects:")
@@ -1298,16 +1351,11 @@ async def video_frame_streaming(sid, data):
         summary = generate_summary(objects, clusters)
 
         # Step 5: Build YOLO results dict with motion data from sensors
-        # Get latest sensor data for this socket (if available)
-        sensor_data = device_sensor_cache.get(sid, {})
-        speed_mps = sensor_data.get("speed_mps")
-        steps_last_3s = sensor_data.get("steps_last_3s")
-
         # Derive is_moving from speed or steps
         # Walking speed ~1.2 m/s, threshold at 0.2 m/s to catch slow movement
         is_moving = True  # Default to moving (safer - will speak more)
         if speed_mps is not None:
-            is_moving = speed_mps > 0.2
+            is_moving = speed_mps >= 0.2
         elif steps_last_3s is not None:
             is_moving = steps_last_3s > 0
 
@@ -1317,8 +1365,14 @@ async def video_frame_streaming(sid, data):
             "emergency_stop": emergency_stop,
             "motion": {
                 "is_moving": is_moving,
-                "speed": speed_mps,
-                "steps_recent": steps_last_3s
+                "speed_mps": speed_mps,
+                "speed_avg_1s_mps": sensor_data.get("speed_avg_1s_mps"),
+                "velocity_x_mps": sensor_data.get("velocity_x_mps"),
+                "velocity_z_mps": sensor_data.get("velocity_z_mps"),
+                "magnetic_x_ut": sensor_data.get("magnetic_x_ut"),
+                "magnetic_z_ut": sensor_data.get("magnetic_z_ut"),
+                "steps_last_3s": steps_last_3s,
+                "steps_since_open": sensor_data.get("steps_since_open"),
             }
         }
 
@@ -1567,5 +1621,5 @@ if __name__ == "__main__":
         socket_app,
         host="0.0.0.0",
         port=8000,
-        log_level="info"
+        log_level="critical"
     )

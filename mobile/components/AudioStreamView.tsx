@@ -31,6 +31,7 @@ type AudioStreamViewProps = {
   onToggleDiagnostics: () => void;
   ttsStatus?: TTSStatus;
   getPendingQuestion?: () => string | undefined;
+  speedMps?: number;
 };
 
 const getMicStatusMeta = (status: StreamStatus): StatusMeta => {
@@ -95,6 +96,7 @@ export const AudioStreamView = ({
   onToggleDiagnostics,
   ttsStatus,
   getPendingQuestion,
+  speedMps,
 }: AudioStreamViewProps) => {
   const insets = useSafeAreaInsets();
   const micStatusMeta = getMicStatusMeta(state.status);
@@ -108,13 +110,17 @@ export const AudioStreamView = ({
   const modalContentInsetStyle = {
     paddingBottom: Math.max(insets.bottom, 32),
   };
+  const overlayInsetStyle = {
+    paddingTop: insets.top + 16,
+    paddingBottom: insets.bottom + 16,
+  };
 
   return (
     <SafeAreaView style={styles.screen}>
       <View style={styles.cameraLayer}>
         <CameraView onFrame={onSendFrame} getPendingQuestion={getPendingQuestion} />
       </View>
-      <View style={styles.overlay} pointerEvents="box-none">
+      <View style={[styles.overlay, overlayInsetStyle]} pointerEvents="box-none">
         <View style={styles.statusRow}>
           <View style={[styles.pill, { backgroundColor: micStatusMeta.bg }]}>
             <View
@@ -160,6 +166,14 @@ export const AudioStreamView = ({
               {deepgramStatusMeta.label}
             </Text>
           </View>
+          {typeof speedMps === "number" && (
+            <View style={[styles.pill, { backgroundColor: "#DBEAFE" }]}>
+              <View style={[styles.statusDot, { backgroundColor: "#1D4ED8" }]} />
+              <Text style={[styles.pillText, { color: "#1D4ED8" }]}>
+                Speed avg 1s {speedMps.toFixed(2)} m/s
+              </Text>
+            </View>
+          )}
         </View>
 
         <View style={styles.controlPanel}>

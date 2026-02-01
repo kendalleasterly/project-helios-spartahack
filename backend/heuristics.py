@@ -104,9 +104,14 @@ def evaluate_scene(
                 "objects": [{"label": str, "distance": str, "position": str}, ...],
                 "emergency_stop": bool,
                 "motion": {
-                    "is_moving": bool,      # From step detector/accelerometer
-                    "speed": float | None,  # Meters per second (optional)
-                    "steps_recent": int     # Steps in last 3-5 seconds (optional)
+                    "is_moving": bool,           # From step detector/accelerometer
+                    "speed_mps": float | None,   # Meters per second (optional)
+                    "speed_avg_1s_mps": float | None,
+                    "steps_last_3s": int,        # Steps in last ~3 seconds (optional)
+                    "velocity_x_mps": float | None,
+                    "velocity_z_mps": float | None,
+                    "magnetic_x_ut": int | None,
+                    "magnetic_z_ut": int | None,
                 }
             }
         recent_objects: Object labels seen in last N seconds (for debouncing)

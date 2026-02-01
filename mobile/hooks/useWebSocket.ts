@@ -19,6 +19,7 @@ export interface TextTokenEvent {
 
 export type DeviceSensorPayload = {
   speed_mps: number;
+  speed_avg_1s_mps: number;
   velocity_x_mps: number;
   velocity_z_mps: number;
   magnetic_x_ut: number;

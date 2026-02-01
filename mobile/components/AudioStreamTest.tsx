@@ -28,9 +28,8 @@ export function MicStreamTest() {
     connect();
   }, [connect]);
 
-  const { getSnapshot } = useDeviceSensorStream({
+  const { getSnapshot, speedMps } = useDeviceSensorStream({
     enabled: backendStatus === "connected",
-    updateIntervalMs: 1000,
   });
 
   const handleSendFrame = useCallback(
@@ -66,6 +65,7 @@ export function MicStreamTest() {
       isDiagnosticsVisible={isDiagnosticsVisible}
       onToggleDiagnostics={handleToggleDiagnostics}
       getPendingQuestion={consumePendingQuestion}
+      speedMps={speedMps}
       ttsStatus={{
         isSpeaking,
         isReady,

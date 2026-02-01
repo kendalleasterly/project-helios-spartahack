@@ -24,6 +24,13 @@ You receive:
 1. Camera image
 2. YOLO detections with positions (left/center/right) and distances (immediate/close/far)
 3. Recent history (what you've said in the last 10 seconds)
+4. Motion/sensor telemetry (per-frame):
+   - speed_mps, speed_avg_1s_mps, velocity_x_mps, velocity_z_mps
+   - magnetic_x_ut, magnetic_z_ut
+   - steps_last_3s, steps_since_open, is_moving (if provided)
+
+Treat the user as MOVING if speed_mps ≥ 0.2 OR steps_last_3s ≥ 1 (or is_moving is true).
+If recent history shows consistent scene shift between frames, assume MOVING.
 
 ## WHEN TO SPEAK (be proactive!)
 ALWAYS speak for:
@@ -31,6 +38,11 @@ ALWAYS speak for:
 - Obstacles in the center of frame (they're walking toward it)
 - People approaching or in their path
 - Hazards: stairs, curbs, vehicles, wet floors, doors opening
+
+When MOVING (speed high or steps detected), be EXTRA proactive:
+- Call out any obstacles in the walking path even if only "close" or "medium"
+- Mention low, trip, or collision hazards early (chairs, tables, poles, bikes, stairs)
+- Prefer safety over silence — avoid missing obstacles
 
 SPEAK for:
 - New objects that could help (chairs, doors, handrails)
@@ -175,6 +187,7 @@ class GeminiContextualNarrator:
         recent_history = scene_analysis.get("recent_history", None)
         urgency_level = scene_analysis.get("urgency_level", None)
         urgency_reason = scene_analysis.get("urgency_reason", None)
+        motion = scene_analysis.get("motion", None)
 
         parts = []
 
@@ -188,6 +201,27 @@ class GeminiContextualNarrator:
         # Recent history (for vision model context)
         if recent_history:
             parts.append(f"📜 RECENT HISTORY:\n{recent_history}\n")
+
+        # Motion/sensor telemetry
+        if motion:
+            motion_fields = []
+            for key in (
+                "speed_mps",
+                "speed_avg_1s_mps",
+                "velocity_x_mps",
+                "velocity_z_mps",
+                "magnetic_x_ut",
+                "magnetic_z_ut",
+                "steps_last_3s",
+                "steps_since_open",
+                "is_moving",
+            ):
+                if key in motion:
+                    value = motion.get(key)
+                    if value is not None:
+                        motion_fields.append(f"{key}={value}")
+            if motion_fields:
+                parts.append(f"📟 MOTION: {', '.join(motion_fields)}")
 
         # Emergency flag
         if emergency:

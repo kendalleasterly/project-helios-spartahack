@@ -88,7 +88,10 @@ class NoteService:
 
     def add_note(self, person_id: str, person_name: str, note_text: str) -> str:
         """
-        Store a note for a person.
+        Store a note for a person (replaces existing note if any).
+
+        Only one note per person is allowed. This deletes any existing notes
+        before adding the new one.
 
         ChromaDB automatically generates embeddings for semantic search.
 
@@ -101,6 +104,11 @@ class NoteService:
             note_id: Unique identifier for the note
         """
         try:
+            # Delete existing notes for this person (one note per person policy)
+            deleted_count = self.delete_all_notes_for_person(person_id)
+            if deleted_count > 0:
+                logger.info(f"Replaced {deleted_count} existing note(s) for {person_name}")
+
             timestamp = time.time()
             note_id = f"{person_id}_{int(timestamp)}"
 

@@ -527,8 +527,9 @@ class BlindAssistantService:
             self.current_person_detected_at = None
 
         # Face detection (run on EVERY frame for maximum accuracy)
-        # Simple synchronous detection for reliability
+        # Face detection with async executor wrapper (prevents blocking event loop)
         import logging
+        import asyncio
         logger = logging.getLogger(__name__)
 
         face_detection_start = time.time()
@@ -538,8 +539,13 @@ class BlindAssistantService:
             nparr = np.frombuffer(image_bytes, np.uint8)
             image = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-            # Detect and recognize faces (synchronous)
-            faces = self.face_service.detect_and_recognize(image)
+            # Detect and recognize faces (run in thread pool to avoid blocking)
+            loop = asyncio.get_event_loop()
+            faces = await loop.run_in_executor(
+                None,  # Use default ThreadPoolExecutor
+                self.face_service.detect_and_recognize,
+                image
+            )
 
             face_detection_ms = (time.time() - face_detection_start) * 1000
 

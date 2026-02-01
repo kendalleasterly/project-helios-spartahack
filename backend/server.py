@@ -105,7 +105,7 @@ def load_yolo_model():
 
         # Load YOLO11 Extra Large model (maximum recall)
         # ultralytics will auto-download yolo11x.pt (~140MB) if not present
-        yolo_model = YOLO('yolo11x.pt')
+        yolo_model = YOLO('yolo11s.pt')
 
         # Move model to GPU
         yolo_model.to(device)
@@ -315,7 +315,7 @@ def calculate_distance(bbox_height: float, image_height: int, label: str = 'defa
 
 
 def annotate_frame(image: np.ndarray, objects: List[Dict[str, Any]],
-                   emergency_stop: bool = False) -> np.ndarray:
+                   emergency_stop: bool = False, faces: List[Dict[str, Any]] = None) -> np.ndarray:
     """
     Draw bounding boxes, labels, and 3x3 grid positions on the image for debugging.
 
@@ -323,6 +323,8 @@ def annotate_frame(image: np.ndarray, objects: List[Dict[str, Any]],
     - Green boxes: Safe objects (far distance)
     - Yellow boxes: Close objects
     - Red boxes: Immediate danger or emergency vehicles
+    - Cyan boxes: Detected faces (known people)
+    - Magenta boxes: Detected faces (unknown people)
 
     Each box shows:
     - Label + Confidence (e.g., "Person 95%")
@@ -333,6 +335,7 @@ def annotate_frame(image: np.ndarray, objects: List[Dict[str, Any]],
         image: Original OpenCV image (BGR format)
         objects: List of detected objects with positions and boxes
         emergency_stop: Whether emergency was triggered
+        faces: List of detected faces with name, location, bbox, is_known
 
     Returns:
         np.ndarray: Annotated image
@@ -450,6 +453,93 @@ def annotate_frame(image: np.ndarray, objects: List[Dict[str, Any]],
         (255, 255, 255),
         2
     )
+
+    # Draw face detection bounding boxes
+    if faces:
+        for face in faces:
+            bbox = face.get('bbox', {})
+            x = bbox.get('x', 0)
+            y = bbox.get('y', 0)
+            w = bbox.get('w', 0)
+            h = bbox.get('h', 0)
+
+            name = face.get('name', 'unknown')
+            is_known = face.get('is_known', False)
+            confidence = face.get('confidence', 0.0)
+            location = face.get('location', '')
+
+            # Color code: Cyan for known people, Magenta for unknown
+            if is_known:
+                color = (255, 255, 0)  # Cyan (BGR)
+                thickness = 3
+            else:
+                color = (255, 0, 255)  # Magenta (BGR)
+                thickness = 2
+
+            # Draw bounding box
+            cv2.rectangle(annotated, (x, y), (x + w, y + h), color, thickness)
+
+            # Prepare label text
+            label_text = f"{name.capitalize()} {int(confidence * 100)}%"
+
+            # Calculate text position (above bounding box)
+            text_y = y - 10 if y - 10 > 20 else y + 20
+
+            # Draw label background for readability
+            (text_width, text_height), baseline = cv2.getTextSize(
+                label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2
+            )
+            cv2.rectangle(
+                annotated,
+                (x, text_y - text_height - 5),
+                (x + text_width + 10, text_y + baseline),
+                color,
+                -1  # Filled rectangle
+            )
+
+            # Draw label text (white text on colored background)
+            cv2.putText(
+                annotated,
+                label_text,
+                (x + 5, text_y - 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),  # White
+                2
+            )
+
+            # Draw location text below the box
+            if location:
+                location_y = y + h + 20
+                location_text = location.replace('-', ' ').title()
+                cv2.rectangle(
+                    annotated,
+                    (x, location_y - 15),
+                    (x + len(location_text) * 10, location_y + 5),
+                    (0, 0, 0),  # Black background
+                    -1
+                )
+                cv2.putText(
+                    annotated,
+                    location_text,
+                    (x + 5, location_y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (255, 255, 255),  # White
+                    1
+                )
+
+        # Add face count in top-right corner (below object count)
+        face_count_text = f"Faces: {len(faces)}"
+        cv2.putText(
+            annotated,
+            face_count_text,
+            (image.shape[1] - 150, 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 0),  # Cyan to match known face color
+            2
+        )
 
     return annotated
 
@@ -1381,7 +1471,9 @@ async def video_frame_streaming(sid, data):
 
         # Step 7: Send debug frame if requested
         if debug_mode:
-            annotated_image = annotate_frame(image, objects, emergency_stop)
+            # Get face detections from assistant (if available)
+            faces = assistant.all_detected_faces if assistant else []
+            annotated_image = annotate_frame(image, objects, emergency_stop, faces)
             _, buffer = cv2.imencode('.jpg', annotated_image)
             debug_base64 = base64.b64encode(buffer).decode('utf-8')
 

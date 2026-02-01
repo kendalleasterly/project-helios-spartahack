@@ -5,7 +5,9 @@ Contextual Gemini Service with Dual-Pipeline Architecture
 Uses standard Gemini API (generate_content_stream) for decision-making and text streaming.
 """
 import base64
+import json
 import os
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Optional, AsyncGenerator, List, Dict, Any
@@ -80,6 +82,11 @@ SPEAK examples:
 SILENT example:
 - "SILENT: Same hallway, clear path, no changes."
 
+## NAVIGATION MODE (when navigation state is active)
+- Use a structured loop: DISCOVER → if goal not found, CHANGE STATE (turn/move) → DISCOVER.
+- If goal is found, give a short plan with spatial cues.
+- While moving, keep giving brief safety and environment updates.
+
 ## KEY MINDSET
 
 You are a GUIDE, not a narrator. The user is walking and needs real-time help:
@@ -107,6 +114,24 @@ CRITICAL RULES:
 - Be direct and helpful
 - Use spatial language: "left", "right", "ahead", "behind", "close", "far"
 - If you can't answer from the image, say so briefly
+
+## NAVIGATION MODE (when the user asks to go somewhere)
+- Enter and persist navigation mode when the user asks to go/find a destination.
+- Use a structured loop:
+  1) DISCOVER: scan and describe what you can see related to the goal
+  2) If goal not found, CHANGE STATE: ask the user to turn or move to a new view
+  3) Repeat DISCOVER until the goal is found
+- Once the goal is found, create a plan (micro-steps if the path is only partially visible).
+- While executing a plan, keep giving short safety cues and environment updates.
+- Keep responses concise, but allow extra words when giving step-by-step guidance.
+
+## NAVIGATION STATE (metadata output)
+You may receive a navigation state in the prompt with the current objective/phase/plan.
+If navigation is active or requested, append a metadata block AFTER your spoken response:
+<nav_state>{"active":true,"objective":"...","phase":"explore|plan|execute|complete","plan":["step 1","step 2"],"note":"short update"}</nav_state>
+- Do NOT speak the <nav_state> block.
+- Keep plan short (1-4 steps). Clear plan to [] once that step is done or you need a new plan.
+- Set active=false and phase="complete" when the user reaches the goal or cancels.
 
 OUTPUT FORMAT:
 - DO NOT use any prefix
@@ -139,11 +164,22 @@ class StreamedResponse:
     total_ms: float
 
 
+@dataclass
+class NavigationState:
+    """Persistent navigation state for structured guidance."""
+    active: bool = False
+    objective: Optional[str] = None
+    phase: str = "idle"  # idle | explore | plan | execute | complete
+    plan: List[str] = field(default_factory=list)
+    last_update_ts: float = 0.0
+
+
 class GeminiContextualNarrator:
     """
     Contextual Gemini narrator using standard API with streaming.
     Maintains conversation history and makes smart decisions about when to speak.
     """
+    _NAV_STATE_PATTERN = re.compile(r"<nav_state>(.*?)</nav_state>", re.IGNORECASE | re.DOTALL)
 
     def __init__(
         self,
@@ -222,6 +258,24 @@ class GeminiContextualNarrator:
             if motion_fields:
                 parts.append(f"📟 MOTION: {', '.join(motion_fields)}")
 
+        # Navigation state (if active)
+        navigation_state = scene_analysis.get("navigation_state")
+        if navigation_state and navigation_state.get("active"):
+            parts.append("🧭 NAVIGATION MODE: ACTIVE")
+            objective = navigation_state.get("objective")
+            phase = navigation_state.get("phase")
+            plan = navigation_state.get("plan") or []
+            plan_age = navigation_state.get("last_update_s_ago")
+
+            if objective:
+                parts.append(f"   Objective: {objective}")
+            if phase:
+                parts.append(f"   Phase: {phase}")
+            if plan:
+                parts.append(f"   Plan: {' | '.join(plan)}")
+            if plan_age is not None:
+                parts.append(f"   Plan age: {plan_age}s")
+
         # Emergency flag
         if emergency:
             parts.append("🚨 EMERGENCY: Vehicle detected very close!")
@@ -249,12 +303,18 @@ class GeminiContextualNarrator:
 
     def _add_to_history(self, role: str, content: str):
         """Add message to history and trim if needed."""
-        self.context_history.append({"role": role, "content": content})
+        self.context_history.append({"role": role, "content": self._strip_nav_state_block(content)})
 
         # Trim old messages if exceeding limit
         if len(self.context_history) > self.max_context_messages:
             # Keep most recent messages
             self.context_history = self.context_history[-self.max_context_messages:]
+
+    def _strip_nav_state_block(self, content: str) -> str:
+        """Remove navigation state metadata blocks from stored history."""
+        if not content:
+            return content
+        return self._NAV_STATE_PATTERN.sub("", content).strip()
 
     async def process_streaming(
         self,
@@ -487,6 +547,167 @@ class BlindAssistantService:
         self.last_spoke_time: float = 0.0  # Timestamp of last speech output
         self.heuristics_config = HeuristicsConfig()
 
+        # Persistent navigation state
+        self.navigation_state = NavigationState()
+
+    _NAV_STATE_PATTERN = re.compile(r"<nav_state>(.*?)</nav_state>", re.IGNORECASE | re.DOTALL)
+
+    def _reset_navigation_state(self):
+        """Clear navigation state."""
+        self.navigation_state.active = False
+        self.navigation_state.objective = None
+        self.navigation_state.phase = "idle"
+        self.navigation_state.plan = []
+        self.navigation_state.last_update_ts = time.time()
+
+    def _start_navigation(self, objective: str):
+        """Start or update navigation with a new objective."""
+        self.navigation_state.active = True
+        self.navigation_state.objective = objective
+        self.navigation_state.phase = "explore"
+        self.navigation_state.plan = []
+        self.navigation_state.last_update_ts = time.time()
+
+    def _is_navigation_cancel(self, user_question: str) -> bool:
+        """Check if the user is cancelling navigation."""
+        text = user_question.lower()
+        cancel_phrases = [
+            "cancel navigation",
+            "stop navigation",
+            "end navigation",
+            "cancel that",
+            "never mind",
+            "nevermind",
+            "forget it",
+            "stop guiding",
+            "stop guidance",
+        ]
+        return any(phrase in text for phrase in cancel_phrases)
+
+    def _is_navigation_request(self, user_question: str) -> bool:
+        """Heuristic check for navigation intent."""
+        text = user_question.lower()
+        patterns = [
+            r"\b(navigate|navigation)\b",
+            r"\b(go|get|head|walk|move|lead|take)\s+(me\s+)?to\b",
+            r"\bfind\b",
+            r"\blocate\b",
+            r"\blook for\b",
+            r"\bwhere\s+is\b",
+            r"\bwhere's\b",
+            r"\bexit\b",
+            r"\bleave\b",
+            r"\bget out\b",
+        ]
+        return any(re.search(pattern, text) for pattern in patterns)
+
+    def _extract_navigation_objective(self, user_question: str) -> str:
+        """Extract a concise navigation target from the user's request."""
+        text = user_question.strip()
+        patterns = [
+            r"\b(?:go|get|head|walk|move|lead|take)\s+(?:me\s+)?to\s+(.+)",
+            r"\b(?:navigate|navigation)\s+to\s+(.+)",
+            r"\b(?:find|locate|look for)\s+(.+)",
+            r"\bwhere\s+is\s+(.+)",
+            r"\bwhere's\s+(.+)",
+            r"\bexit\s+(.+)",
+            r"\bleave\s+(.+)",
+            r"\bget out(?: of)?\s+(.+)",
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                objective = match.group(1)
+                return objective.strip(" .,!?:;\"'").strip()
+        return text.strip(" .,!?:;\"'").strip()
+
+    def _handle_navigation_intent(self, user_question: str):
+        """Update navigation state based on the current user request."""
+        if not user_question:
+            return
+        if self._is_navigation_cancel(user_question):
+            self._reset_navigation_state()
+            return
+        if self._is_navigation_request(user_question):
+            objective = self._extract_navigation_objective(user_question)
+            if (not self.navigation_state.active) or (objective != self.navigation_state.objective):
+                self._start_navigation(objective)
+            else:
+                self.navigation_state.last_update_ts = time.time()
+
+    def _navigation_prompt_payload(self) -> Optional[Dict[str, Any]]:
+        """Build navigation state payload for prompt injection."""
+        # TODO: consider programmatic cue cadence (e.g., every 3s or 3 steps) if needed.
+        if not self.navigation_state.active:
+            return None
+        payload: Dict[str, Any] = {
+            "active": True,
+            "objective": self.navigation_state.objective,
+            "phase": self.navigation_state.phase,
+            "plan": self.navigation_state.plan[:4],
+        }
+        if self.navigation_state.last_update_ts:
+            payload["last_update_s_ago"] = int(time.time() - self.navigation_state.last_update_ts)
+        return payload
+
+    def _strip_code_fence(self, text: str) -> str:
+        """Strip surrounding code fences if present."""
+        if text.startswith("```"):
+            lines = text.splitlines()
+            if len(lines) >= 2 and lines[-1].startswith("```"):
+                return "\n".join(lines[1:-1]).strip()
+        return text
+
+    def _extract_nav_state_block(self, text: str) -> tuple[str, Optional[dict]]:
+        """Extract navigation state metadata from the model response."""
+        if not text:
+            return text, None
+        match = self._NAV_STATE_PATTERN.search(text)
+        if not match:
+            return text.strip(), None
+        json_blob = self._strip_code_fence(match.group(1).strip())
+        cleaned = (text[:match.start()] + text[match.end():]).strip()
+        try:
+            nav_update = json.loads(json_blob)
+        except json.JSONDecodeError:
+            nav_update = None
+        return cleaned, nav_update
+
+    def _apply_navigation_update(self, nav_update: dict):
+        """Apply a navigation state update from the model."""
+        if not isinstance(nav_update, dict):
+            return
+
+        active = nav_update.get("active")
+        phase = nav_update.get("phase")
+
+        if active is False or phase == "complete":
+            self._reset_navigation_state()
+            self.navigation_state.phase = "complete"
+            return
+
+        if active is True:
+            self.navigation_state.active = True
+
+        objective = nav_update.get("objective")
+        if isinstance(objective, str) and objective.strip():
+            self.navigation_state.objective = objective.strip()
+
+        if isinstance(phase, str) and phase.strip():
+            self.navigation_state.phase = phase.strip()
+
+        if nav_update.get("clear_plan") is True:
+            self.navigation_state.plan = []
+        else:
+            plan = nav_update.get("plan")
+            if isinstance(plan, str) and plan.strip():
+                self.navigation_state.plan = [plan.strip()]
+            elif isinstance(plan, list):
+                cleaned_plan = [str(step).strip() for step in plan if str(step).strip()]
+                self.navigation_state.plan = cleaned_plan[:4]
+
+        self.navigation_state.last_update_ts = time.time()
+
     async def process_frame(
         self,
         frame_base64: str,
@@ -555,6 +776,9 @@ class BlindAssistantService:
             "urgency_reason": decision.reason,
             "recent_history": self._build_vision_history_context()
         }
+        navigation_payload = self._navigation_prompt_payload()
+        if navigation_payload:
+            scene_with_urgency["navigation_state"] = navigation_payload
 
         # Call Gemini vision narrator
         response = await self.vision_narrator.process_input(
@@ -596,6 +820,9 @@ class BlindAssistantService:
 
         logger.info(f"💬 CONVERSATION PIPELINE | Question: '{user_question}'")
 
+        # Update navigation state from user intent (start/stop)
+        self._handle_navigation_intent(user_question)
+
         if not self.latest_frame:
             logger.warning("⚠️ No latest frame available yet")
             return "I haven't seen anything yet. Please wait a moment."
@@ -613,6 +840,9 @@ class BlindAssistantService:
             "objects": self.latest_yolo.get("objects", []) if self.latest_yolo else [],
             "emergency_stop": False  # User questions aren't emergencies
         }
+        navigation_payload = self._navigation_prompt_payload()
+        if navigation_payload:
+            scene_analysis["navigation_state"] = navigation_payload
         logger.info(f"📊 Scene analysis | Objects: {len(scene_analysis['objects'])}")
 
         # Conversation model gets vision context + question
@@ -625,7 +855,10 @@ class BlindAssistantService:
 
         logger.info(f"✅ Got response | Should speak: {response.should_speak} | Text: '{response.full_text}' | Length: {len(response.full_text)}")
 
-        return response.full_text
+        spoken_text, nav_update = self._extract_nav_state_block(response.full_text)
+        if nav_update:
+            self._apply_navigation_update(nav_update)
+        return spoken_text
 
     def _build_vision_history_context(self) -> str:
         """

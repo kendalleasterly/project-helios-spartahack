@@ -76,7 +76,9 @@ export default function CameraView({ onFrame, getPendingQuestion, onFrameCapture
           );
         }
 
-        onFrameRef.current(base64Data, pendingQuestion);
+        // Enable debug mode to see bounding boxes on frames
+        const DEBUG_MODE = true;
+        onFrameRef.current(base64Data, pendingQuestion, DEBUG_MODE);
       };
 
       reader.readAsDataURL(blob);

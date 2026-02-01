@@ -10,6 +10,13 @@ python-multipart==0.0.20
 websocket-client>=1.8.0
 networkx==3.2.1
 
+# Person Memory Feature
+deepface==0.0.92
+chromadb==0.5.23
+# TensorFlow (CPU-only - Windows doesn't support GPU in TF 2.11+)
+tensorflow==2.18.0
+tf-keras==2.18.0
+
 # Test client dependencies
 colorama==0.4.6
 google-genai>=1.0.0

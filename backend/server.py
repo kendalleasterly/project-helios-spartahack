@@ -8,10 +8,11 @@ import base64
 import io
 import logging
 import os
+import re
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import cv2
 import networkx as nx
@@ -104,7 +105,7 @@ def load_yolo_model():
 
         # Load YOLO11 Extra Large model (maximum recall)
         # ultralytics will auto-download yolo11x.pt (~140MB) if not present
-        yolo_model = YOLO('yolo11x.pt')
+        yolo_model = YOLO('yolo11s.pt')
 
         # Move model to GPU
         yolo_model.to(device)
@@ -314,7 +315,7 @@ def calculate_distance(bbox_height: float, image_height: int, label: str = 'defa
 
 
 def annotate_frame(image: np.ndarray, objects: List[Dict[str, Any]],
-                   emergency_stop: bool = False) -> np.ndarray:
+                   emergency_stop: bool = False, faces: List[Dict[str, Any]] = None) -> np.ndarray:
     """
     Draw bounding boxes, labels, and 3x3 grid positions on the image for debugging.
 
@@ -322,6 +323,8 @@ def annotate_frame(image: np.ndarray, objects: List[Dict[str, Any]],
     - Green boxes: Safe objects (far distance)
     - Yellow boxes: Close objects
     - Red boxes: Immediate danger or emergency vehicles
+    - Cyan boxes: Detected faces (known people)
+    - Magenta boxes: Detected faces (unknown people)
 
     Each box shows:
     - Label + Confidence (e.g., "Person 95%")
@@ -332,6 +335,7 @@ def annotate_frame(image: np.ndarray, objects: List[Dict[str, Any]],
         image: Original OpenCV image (BGR format)
         objects: List of detected objects with positions and boxes
         emergency_stop: Whether emergency was triggered
+        faces: List of detected faces with name, location, bbox, is_known
 
     Returns:
         np.ndarray: Annotated image
@@ -449,6 +453,93 @@ def annotate_frame(image: np.ndarray, objects: List[Dict[str, Any]],
         (255, 255, 255),
         2
     )
+
+    # Draw face detection bounding boxes
+    if faces:
+        for face in faces:
+            bbox = face.get('bbox', {})
+            x = bbox.get('x', 0)
+            y = bbox.get('y', 0)
+            w = bbox.get('w', 0)
+            h = bbox.get('h', 0)
+
+            name = face.get('name', 'unknown')
+            is_known = face.get('is_known', False)
+            confidence = face.get('confidence', 0.0)
+            location = face.get('location', '')
+
+            # Color code: Cyan for known people, Magenta for unknown
+            if is_known:
+                color = (255, 255, 0)  # Cyan (BGR)
+                thickness = 3
+            else:
+                color = (255, 0, 255)  # Magenta (BGR)
+                thickness = 2
+
+            # Draw bounding box
+            cv2.rectangle(annotated, (x, y), (x + w, y + h), color, thickness)
+
+            # Prepare label text
+            label_text = f"{name.capitalize()} {int(confidence * 100)}%"
+
+            # Calculate text position (above bounding box)
+            text_y = y - 10 if y - 10 > 20 else y + 20
+
+            # Draw label background for readability
+            (text_width, text_height), baseline = cv2.getTextSize(
+                label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.7, 2
+            )
+            cv2.rectangle(
+                annotated,
+                (x, text_y - text_height - 5),
+                (x + text_width + 10, text_y + baseline),
+                color,
+                -1  # Filled rectangle
+            )
+
+            # Draw label text (white text on colored background)
+            cv2.putText(
+                annotated,
+                label_text,
+                (x + 5, text_y - 5),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (255, 255, 255),  # White
+                2
+            )
+
+            # Draw location text below the box
+            if location:
+                location_y = y + h + 20
+                location_text = location.replace('-', ' ').title()
+                cv2.rectangle(
+                    annotated,
+                    (x, location_y - 15),
+                    (x + len(location_text) * 10, location_y + 5),
+                    (0, 0, 0),  # Black background
+                    -1
+                )
+                cv2.putText(
+                    annotated,
+                    location_text,
+                    (x + 5, location_y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (255, 255, 255),  # White
+                    1
+                )
+
+        # Add face count in top-right corner (below object count)
+        face_count_text = f"Faces: {len(faces)}"
+        cv2.putText(
+            annotated,
+            face_count_text,
+            (image.shape[1] - 150, 60),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            (255, 255, 0),  # Cyan to match known face color
+            2
+        )
 
     return annotated
 
@@ -1069,7 +1160,15 @@ async def startup_event():
         logger.info("✓ Blind Assistant Service initialized successfully")
         logger.info("  - Vision Pipeline: Continuous monitoring with spatial memory")
         logger.info("  - Conversation Pipeline: On-demand with context injection")
-        logger.info("  - Model: gemini-2.5-flash")
+        logger.info("  - Model: gemini-3.0-flash-preview")
+
+        # Preload person memory models to avoid runtime delays
+        logger.info("🚀 Preloading person memory models...")
+        if assistant.face_service:
+            assistant.face_service.preload_models()
+        if assistant.note_service:
+            assistant.note_service.preload_models()
+        logger.info("✅ All models preloaded successfully")
 
     except Exception as e:
         logger.error(f"✗ Failed to initialize Blind Assistant Service: {e}")
@@ -1101,6 +1200,63 @@ async def health():
         "model_loaded": yolo_model is not None,
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
+
+
+# ============================================================================
+# PERSON MEMORY COMMAND DETECTION
+# ============================================================================
+
+def detect_person_command(text: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Detect person memory commands in user speech.
+
+    Returns:
+        (command_type, person_name) where command_type is:
+        - 'save_person': User wants to save a person's face
+        - 'note_request': User wants to leave a note (needs to wait for note content)
+        - None: Not a person command
+
+    Examples:
+        - "remember this person as John" -> ('save_person', 'John')
+        - "save this person as Sarah" -> ('save_person', 'Sarah')
+        - "this is Alice" -> ('save_person', 'Alice')
+        - "leave a note for Bob" -> ('note_request', 'Bob')
+        - "make a note for Sarah" -> ('note_request', 'Sarah')
+    """
+    if not text:
+        return None, None
+
+    text_lower = text.lower().strip()
+
+    # Save person patterns (multiple variations for flexibility)
+    save_patterns = [
+        r'(?:helios,?\s+)?(?:remember|save)\s+this\s+person\s+as\s+(.+)',  # "remember this person as John"
+        r'(?:helios,?\s+)?(?:remember|save)\s+this\s+as\s+(.+)',           # "remember this as John"
+        r'(?:helios,?\s+)?this\s+is\s+(.+)',                                # "this is John"
+    ]
+
+    for pattern in save_patterns:
+        match = re.match(pattern, text_lower)
+        if match:
+            name = match.group(1).strip()
+            # Avoid false positives (filter out common phrases)
+            if len(name) >= 2 and not any(word in name for word in ['to ', 'that ', 'the ', 'a ']):
+                return 'save_person', name
+
+    # Note request patterns (multiple variations for flexibility)
+    note_patterns = [
+        r'(?:helios,?\s+)?(?:leave|make|save|take)\s+a\s+note\s+(?:for|about)\s+(.+)',
+        r'(?:helios,?\s+)?note\s+(?:for|about)\s+(.+)',
+    ]
+
+    for pattern in note_patterns:
+        match = re.match(pattern, text_lower)
+        if match:
+            name = match.group(1).strip()
+            if len(name) >= 2:
+                return 'note_request', name
+
+    return None, None
 
 
 # ============================================================================
@@ -1180,27 +1336,13 @@ async def video_frame_streaming(sid, data):
             )
 
         inference_ms = (asyncio.get_event_loop().time() - inference_start) * 1000
-        logger.info(f"⚡ YOLO inference: {inference_ms:.2f}ms")
+        # Removed YOLO inference time and object list logging for cleaner face detection debugging
 
         # Step 3: Process detections
         detection_data = process_detections(results, image_height, image_width)
         objects = detection_data['objects']
         clusters = detection_data['clusters']
         emergency_stop = detection_data['emergency_stop']
-
-        # Log detected objects with distances for testing/debugging
-        if objects:
-            logger.info(f"📦 Detected {len(objects)} objects:")
-            for obj in objects[:10]:  # Log first 10 objects to avoid spam
-                label = obj.get('label', 'unknown')
-                distance = obj.get('distance', 'unknown')
-                position = obj.get('position', 'unknown')
-                confidence = obj.get('confidence', 0.0)
-                logger.info(f"   • {label.upper()}: {distance} | {position} | conf={confidence:.0%}")
-            if len(objects) > 10:
-                logger.info(f"   ... and {len(objects) - 10} more objects")
-        else:
-            logger.debug("📦 No objects detected")
 
         # Step 4: Generate summary
         summary = generate_summary(objects, clusters)
@@ -1224,6 +1366,40 @@ async def video_frame_streaming(sid, data):
             # CONVERSATION PIPELINE: Frontend already handled wake word, just process the question
             logger.info(f"🎤 USER QUESTION RECEIVED: '{user_question}' | Length: {len(user_question)} | SID: {sid}")
 
+            # ====================================================================
+            # INTERCEPT PERSON MEMORY COMMANDS (Backend Safety Layer)
+            # ====================================================================
+            # Check if this is a person memory command that should NOT go to Gemini.
+            # This is a backend safety layer in case frontend doesn't intercept it.
+            command_type, person_name = detect_person_command(user_question)
+
+            if command_type == 'note_request':
+                # User wants to leave a note - acknowledge and let frontend accumulate content
+                logger.info(f"📝 Note request detected for: {person_name}")
+                await sio.emit('note_request_acknowledged', {
+                    'person_name': person_name,
+                    'message': f'Listening for note about {person_name}'
+                }, room=sid)
+                # Log completion without sending to Gemini
+                total_time = (asyncio.get_event_loop().time() - start_time) * 1000
+                logger.info(f"✅ [CONVERSATION] COMPLETE: {total_time:.0f}ms total | YOLO: {inference_ms:.0f}ms | Objects: {len(objects)} | Response: Note request acknowledged for {person_name}")
+                return
+
+            elif command_type == 'save_person':
+                # User wants to save a person - acknowledge and wait for frontend to send frame
+                logger.info(f"💾 Save person request detected for: {person_name}")
+                await sio.emit('save_person_acknowledged', {
+                    'person_name': person_name,
+                    'message': f'Ready to save {person_name}'
+                }, room=sid)
+                # Log completion without sending to Gemini
+                total_time = (asyncio.get_event_loop().time() - start_time) * 1000
+                logger.info(f"✅ [CONVERSATION] COMPLETE: {total_time:.0f}ms total | YOLO: {inference_ms:.0f}ms | Objects: {len(objects)} | Response: Save person acknowledged for {person_name}")
+                return
+
+            # ====================================================================
+            # REGULAR QUESTION PROCESSING (Not a person command)
+            # ====================================================================
             try:
                 # Call Gemini with the question directly
                 async with gemini_vision_lock:
@@ -1234,7 +1410,7 @@ async def video_frame_streaming(sid, data):
                     gemini_duration = (asyncio.get_event_loop().time() - gemini_start) * 1000
 
                     logger.info(f"✅ GEMINI RESPONSE RECEIVED | Duration: {gemini_duration:.0f}ms | Length: {len(response_text)} chars")
-                    logger.info(f"📝 Full Response: '{response_text}'")
+                    logger.debug(f"📝 Response preview: {response_text[:100]}{'...' if len(response_text) > 100 else ''}")
 
                     # Send response to client
                     logger.info(f"📡 Emitting 'text_response' to client {sid}...")
@@ -1271,13 +1447,33 @@ async def video_frame_streaming(sid, data):
                     # Normal operation - silently building spatial memory
                     logger.debug("👁️  Vision: Spatial memory updated (silent)")
 
+                # Check for new person detections (announce once per session)
+                person_notification = assistant.get_person_detection_notification()
+                if person_notification:
+                    logger.info(f"👋 Announcing new person: {person_notification['person_name']}")
+
+                    await sio.emit('person_detected', {
+                        'person_id': person_notification['person_id'],
+                        'person_name': person_notification['person_name'],
+                        'notes': person_notification['notes']
+                    }, room=sid)
+
+                    # Send TTS notification
+                    await sio.emit('text_response', {
+                        'text': person_notification['message'],
+                        'mode': 'person_detection',
+                        'emergency': False
+                    }, room=sid)
+
             except Exception as e:
                 logger.error(f"✗ Vision pipeline error: {e}", exc_info=True)
                 await sio.emit('error', {'message': f'Vision processing failed: {e}'}, room=sid)
 
         # Step 7: Send debug frame if requested
         if debug_mode:
-            annotated_image = annotate_frame(image, objects, emergency_stop)
+            # Get face detections from assistant (if available)
+            faces = assistant.all_detected_faces if assistant else []
+            annotated_image = annotate_frame(image, objects, emergency_stop, faces)
             _, buffer = cv2.imencode('.jpg', annotated_image)
             debug_base64 = base64.b64encode(buffer).decode('utf-8')
 
@@ -1311,6 +1507,154 @@ async def video_frame_streaming(sid, data):
         await sio.emit('error', {
             'message': 'Frame processing failed',
             'error': str(e)
+        }, room=sid)
+
+
+@sio.event
+async def save_person(sid, data):
+    """
+    Save a new person's face when user says "remember this person as [name]".
+
+    Expected data:
+    {
+        'name': str,           # Person's name from speech recognition
+        'frame': str           # Base64 image with face to save
+    }
+    """
+    try:
+        person_name = data.get('name')
+        frame_base64 = data.get('frame')
+
+        if not person_name:
+            await sio.emit('error', {
+                'message': 'Missing person name'
+            }, room=sid)
+            return
+
+        if not frame_base64:
+            await sio.emit('error', {
+                'message': 'Missing frame data'
+            }, room=sid)
+            return
+
+        logger.info(f"💾 Saving new person: {person_name}")
+
+        # Decode frame
+        image = decode_base64_image(frame_base64)
+
+        # Save to face database
+        if not assistant:
+            await sio.emit('error', {
+                'message': 'Assistant service not available'
+            }, room=sid)
+            return
+
+        person_id = assistant.face_service.add_known_person(
+            name=person_name,
+            face_image=image
+        )
+
+        logger.info(f"✅ Saved new person: {person_name} (ID: {person_id})")
+
+        confirmation_message = f"I'll remember {person_name}."
+
+        await sio.emit('person_saved', {
+            'name': person_name,
+            'person_id': person_id,
+            'message': confirmation_message
+        }, room=sid)
+
+        # Send TTS confirmation
+        await sio.emit('text_response', {
+            'text': confirmation_message,
+            'mode': 'person_memory',
+            'emergency': False
+        }, room=sid)
+
+    except ValueError as e:
+        logger.error(f"❌ Validation error saving person: {e}")
+        await sio.emit('error', {
+            'message': str(e)
+        }, room=sid)
+    except Exception as e:
+        logger.error(f"❌ Error saving person: {e}", exc_info=True)
+        await sio.emit('error', {
+            'message': f'Failed to save person: {str(e)}'
+        }, room=sid)
+
+
+@sio.event
+async def save_note(sid, data):
+    """
+    Save a note for a person when user says "leave a note for [name]".
+
+    Expected data:
+    {
+        'person_name': str,    # Target person's name
+        'note_text': str       # The note content
+    }
+    """
+    try:
+        person_name = data.get('person_name')
+        note_text = data.get('note_text')
+
+        if not person_name:
+            await sio.emit('error', {
+                'message': 'Missing person name'
+            }, room=sid)
+            return
+
+        if not note_text:
+            await sio.emit('error', {
+                'message': 'Missing note text'
+            }, room=sid)
+            return
+
+        logger.info(f"📝 Saving note for {person_name}: {note_text[:50]}{'...' if len(note_text) > 50 else ''}")
+
+        if not assistant:
+            await sio.emit('error', {
+                'message': 'Assistant service not available'
+            }, room=sid)
+            return
+
+        # Lookup person by name
+        person = assistant.face_service.get_person_by_name(person_name)
+
+        if not person:
+            await sio.emit('error', {
+                'message': f"I don't know anyone named {person_name}. Please save their face first."
+            }, room=sid)
+            return
+
+        # Save note to ChromaDB
+        assistant.note_service.add_note(
+            person_id=person.person_id,
+            person_name=person_name,
+            note_text=note_text
+        )
+
+        logger.info(f"✅ Saved note for {person_name}")
+
+        confirmation_message = f"Note saved for {person_name}: {note_text}"
+
+        await sio.emit('note_saved', {
+            'person_name': person_name,
+            'note_text': note_text,
+            'message': confirmation_message
+        }, room=sid)
+
+        # Send TTS confirmation (repeat the note back)
+        await sio.emit('text_response', {
+            'text': confirmation_message,
+            'mode': 'person_memory',
+            'emergency': False
+        }, room=sid)
+
+    except Exception as e:
+        logger.error(f"❌ Error saving note: {e}", exc_info=True)
+        await sio.emit('error', {
+            'message': f'Failed to save note: {str(e)}'
         }, room=sid)
 
 

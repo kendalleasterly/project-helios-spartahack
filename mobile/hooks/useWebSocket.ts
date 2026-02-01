@@ -3,6 +3,7 @@ import { io, Socket } from "socket.io-client";
 import { BACKEND_SERVER_URL } from "@env";
 
 const SERVER_URL = BACKEND_SERVER_URL || "http://192.168.137.1:8000";
+console.log('WebSocket connecting to:', SERVER_URL);
 
 export type ConnectionStatus =
   | "disconnected"
@@ -93,10 +94,13 @@ export function useWebSocket(): UseWebSocketReturn {
 
   const sendFrame = useCallback((base64Frame: string, debug = false) => {
     if (socketRef.current?.connected) {
+      console.log(`Sending frame to backend (${base64Frame.length} bytes)`);
       socketRef.current.emit("video_frame_streaming", {
         frame: base64Frame,
         debug,
       });
+    } else {
+      console.warn('Cannot send frame: socket not connected');
     }
   }, []);
 

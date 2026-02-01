@@ -1,13 +1,15 @@
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { AudioStreamView } from "@/components/AudioStreamView";
 import { useAudioStreamViewModel } from "@/components/AudioStreamViewModel";
 import { useWebSocket } from "@/hooks/useWebSocket";
 import { useAudioGuidance } from "@/hooks/useAudioGuidance";
 import { useWakeWord } from "@/hooks/useWakeWord";
+import { useDeviceSensorStream } from "@/hooks/useDeviceSensorStream";
 
 export function MicStreamTest() {
   const { state, actions } = useAudioStreamViewModel();
-  const { status: backendStatus, sendFrame, connect, onTextToken } = useWebSocket();
+  const { status: backendStatus, sendFrame, sendDeviceSensors, connect, onTextToken } =
+    useWebSocket();
   const [isDiagnosticsVisible, setIsDiagnosticsVisible] = useState(false);
 
   // Wake word detection - monitors transcripts for "Helios"
@@ -25,6 +27,21 @@ export function MicStreamTest() {
   useEffect(() => {
     connect();
   }, [connect]);
+
+  const { getSnapshot } = useDeviceSensorStream({
+    enabled: backendStatus === "connected",
+    updateIntervalMs: 1000,
+  });
+
+  const handleSendFrame = useCallback(
+    (base64Frame: string, userQuestion?: string, debug?: boolean) => {
+      sendFrame(base64Frame, userQuestion, debug);
+      if (backendStatus === "connected") {
+        sendDeviceSensors(getSnapshot());
+      }
+    },
+    [backendStatus, getSnapshot, sendDeviceSensors, sendFrame]
+  );
 
   // Log TTS status
   useEffect(() => {
@@ -45,7 +62,7 @@ export function MicStreamTest() {
       state={state}
       actions={actions}
       backendStatus={backendStatus}
-      onSendFrame={sendFrame}
+      onSendFrame={handleSendFrame}
       isDiagnosticsVisible={isDiagnosticsVisible}
       onToggleDiagnostics={handleToggleDiagnostics}
       getPendingQuestion={consumePendingQuestion}

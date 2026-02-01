@@ -6,6 +6,7 @@ Receives video frames via Socket.IO, processes with YOLO11, returns semantic spa
 import asyncio
 import base64
 import io
+import json
 import logging
 import os
 import uuid
@@ -80,6 +81,10 @@ EMERGENCY_DISTANCES = {'immediate', 'close'}
 # Debug Recording Configuration
 SAVE_DEBUG_FRAMES = os.getenv('SAVE_DEBUG_FRAMES', 'true').lower() == 'true'
 DEBUG_OUTPUT_DIR = Path('server_debug_output')
+DEVICE_STREAM_LOG_MAX_CHARS = int(os.getenv('DEVICE_STREAM_LOG_MAX_CHARS', '1200'))
+
+# Track device stream message counts per socket
+device_stream_counts: Dict[str, int] = {}
 
 
 def _select_torch_device() -> str:
@@ -163,6 +168,17 @@ def decode_base64_image(base64_string: str) -> np.ndarray:
     except Exception as e:
         logger.error(f"Error decoding base64 image: {e}")
         raise
+
+
+def _format_device_stream_payload(payload: Any, max_chars: int) -> str:
+    """Serialize device stream payload for logging with safe truncation."""
+    try:
+        text = json.dumps(payload, ensure_ascii=True, separators=(",", ":"), default=str)
+    except Exception:
+        text = repr(payload)
+    if len(text) > max_chars:
+        return f"{text[:max_chars]}...<truncated>"
+    return text
 
 
 def calculate_3x3_position(bbox_center_x: float, bbox_center_y: float,
@@ -1130,6 +1146,7 @@ async def health():
 async def connect(sid, environ):
     """Handle client connection."""
     logger.info(f"✓ Client connected: {sid}")
+    device_stream_counts[sid] = 0
     await sio.emit('connection_established', {'status': 'connected'}, room=sid)
 
 
@@ -1137,6 +1154,55 @@ async def connect(sid, environ):
 async def disconnect(sid):
     """Handle client disconnection."""
     logger.info(f"✗ Client disconnected: {sid}")
+    device_stream_counts.pop(sid, None)
+
+
+@sio.event
+async def device_sensor_stream(sid, data):
+    """
+    Receive device sensor/motion data stream from mobile clients.
+
+    Expected data:
+    {
+        "speed_mps": 0.12,
+        "velocity_x_mps": 0.03,
+        "velocity_z_mps": -0.08,
+        "magnetic_x_ut": 12.3,
+        "magnetic_z_ut": -4.1,
+        "steps_last_3s": 2,
+        "steps_since_open": 1200
+    }
+    """
+    device_stream_counts[sid] = device_stream_counts.get(sid, 0) + 1
+    if isinstance(data, dict):
+        payload = {
+            "speed_mps": data.get("speed_mps", data.get("speed")),
+            "velocity_x_mps": data.get("velocity_x_mps", data.get("dx")),
+            "velocity_z_mps": data.get("velocity_z_mps", data.get("dz")),
+            "magnetic_x_ut": data.get(
+                "magnetic_x_ut",
+                data.get("magnetometer_x", data.get("magnometer_x")),
+            ),
+            "magnetic_z_ut": data.get(
+                "magnetic_z_ut",
+                data.get("magnetometer_z", data.get("magnometer_z")),
+            ),
+            "steps_last_3s": data.get("steps_last_3s"),
+            "steps_since_open": data.get("steps_since_open", data.get("steps_live")),
+        }
+    else:
+        payload = {
+            "speed_mps": None,
+            "velocity_x_mps": None,
+            "velocity_z_mps": None,
+            "magnetic_x_ut": None,
+            "magnetic_z_ut": None,
+            "steps_last_3s": None,
+            "steps_since_open": None,
+        }
+
+    payload_preview = _format_device_stream_payload(payload, DEVICE_STREAM_LOG_MAX_CHARS)
+    logger.info(f"📱 Device stream [{sid}] #{device_stream_counts[sid]}: {payload_preview}")
 
 
 @sio.event

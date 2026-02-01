@@ -17,6 +17,16 @@ export interface TextTokenEvent {
   is_first: boolean;
 }
 
+export type DeviceSensorPayload = {
+  speed_mps: number;
+  velocity_x_mps: number;
+  velocity_z_mps: number;
+  magnetic_x_ut: number;
+  magnetic_z_ut: number;
+  steps_last_3s: number;
+  steps_since_open: number;
+};
+
 // Backend main branch sends text_response events with this format
 interface TextResponseEvent {
   text: string;
@@ -30,6 +40,7 @@ interface UseWebSocketReturn {
   socket: Socket | null;
   status: ConnectionStatus;
   sendFrame: (base64Frame: string, userQuestion?: string, debug?: boolean) => void;
+  sendDeviceSensors: (payload: DeviceSensorPayload) => void;
   onTextToken: (callback: TextTokenCallback) => void;
   connect: () => void;
   disconnect: () => void;
@@ -152,6 +163,12 @@ export function useWebSocket(): UseWebSocketReturn {
     }
   }, []);
 
+  const sendDeviceSensors = useCallback((payload: DeviceSensorPayload) => {
+    if (socketRef.current?.connected) {
+      socketRef.current.emit("device_sensor_stream", payload);
+    }
+  }, []);
+
   const onTextToken = useCallback((callback: TextTokenCallback) => {
     textTokenCallbackRef.current = callback;
   }, []);
@@ -166,6 +183,7 @@ export function useWebSocket(): UseWebSocketReturn {
     socket: socketRef.current,
     status,
     sendFrame,
+    sendDeviceSensors,
     onTextToken,
     connect,
     disconnect,

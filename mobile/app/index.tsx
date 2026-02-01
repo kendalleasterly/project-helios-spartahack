@@ -1,4 +1,5 @@
 import { AudioStreamTest } from "@/components/AudioStreamTest"
+import { MagnetometerReadout } from "@/components/MagnetometerReadout"
 import { registerRootComponent } from "expo"
 import { SafeAreaProvider } from "react-native-safe-area-context"
 
@@ -7,11 +8,8 @@ function App() {
 		<SafeAreaProvider>
 			<AudioStreamTest />
 			{/* <AccelerometerLogger />
-			<MagnetometerLogger />
-			<View>
-				<VelocityReadout />
-				<MagnetometerReadout />
-			</View> */}
+			<VelocityReadout /> */}
+			<MagnetometerReadout />
 		</SafeAreaProvider>
 	)
 }

@@ -22,13 +22,22 @@ type StatusMeta = {
   bg: string;
 };
 
+type TTSStatus = {
+  isSpeaking: boolean;
+  isReady: boolean;
+  isInitializing: boolean;
+  error: string | null;
+};
+
 type AudioStreamViewProps = {
   state: AudioStreamViewState;
   actions: AudioStreamViewActions;
   backendStatus: BackendStatus;
-  onSendFrame: (base64Frame: string, debug?: boolean) => void;
+  onSendFrame: (base64Frame: string, userQuestion?: string, debug?: boolean) => void;
   isDiagnosticsVisible: boolean;
   onToggleDiagnostics: () => void;
+  ttsStatus?: TTSStatus;
+  getPendingQuestion?: () => string | undefined;
 };
 
 const getMicStatusMeta = (status: StreamStatus): StatusMeta => {
@@ -75,6 +84,15 @@ const getBackendStatusMeta = (status: BackendStatus): StatusMeta => {
   }
 };
 
+const getTTSStatusMeta = (tts?: TTSStatus): StatusMeta => {
+  if (!tts) return { label: "TTS Disabled", color: "#64748B", bg: "#F1F5F9" };
+  if (tts.error) return { label: "TTS Error", color: "#B91C1C", bg: "#FEE2E2" };
+  if (tts.isInitializing) return { label: "TTS Loading", color: "#B45309", bg: "#FEF3C7" };
+  if (tts.isSpeaking) return { label: "Speaking", color: "#047857", bg: "#D1FAE5" };
+  if (tts.isReady) return { label: "TTS Ready", color: "#0F766E", bg: "#CCFBF1" };
+  return { label: "TTS Idle", color: "#64748B", bg: "#F1F5F9" };
+};
+
 export const AudioStreamView = ({
   state,
   actions,
@@ -82,10 +100,13 @@ export const AudioStreamView = ({
   onSendFrame,
   isDiagnosticsVisible,
   onToggleDiagnostics,
+  ttsStatus,
+  getPendingQuestion,
 }: AudioStreamViewProps) => {
   const micStatusMeta = getMicStatusMeta(state.status);
   const deepgramStatusMeta = getDeepgramStatusMeta(state.deepgramStatus);
   const backendStatusMeta = getBackendStatusMeta(backendStatus);
+  const ttsStatusMeta = getTTSStatusMeta(ttsStatus);
   const frameSampleRate = state.lastFrame ? state.lastFrame.sampleRate : null;
   const diagnosticsLabel = isDiagnosticsVisible
     ? "Hide Diagnostics"
@@ -94,7 +115,7 @@ export const AudioStreamView = ({
   return (
     <SafeAreaView style={styles.screen}>
       <View style={styles.cameraLayer}>
-        <CameraView onFrame={onSendFrame} />
+        <CameraView onFrame={onSendFrame} getPendingQuestion={getPendingQuestion} />
       </View>
       <View style={styles.overlay} pointerEvents="box-none">
         <View style={styles.statusRow}>
@@ -118,6 +139,17 @@ export const AudioStreamView = ({
             />
             <Text style={[styles.pillText, { color: backendStatusMeta.color }]}>
               {backendStatusMeta.label}
+            </Text>
+          </View>
+          <View style={[styles.pill, { backgroundColor: ttsStatusMeta.bg }]}>
+            <View
+              style={[
+                styles.statusDot,
+                { backgroundColor: ttsStatusMeta.color },
+              ]}
+            />
+            <Text style={[styles.pillText, { color: ttsStatusMeta.color }]}>
+              {ttsStatusMeta.label}
             </Text>
           </View>
           <View style={[styles.pill, { backgroundColor: deepgramStatusMeta.bg }]}>

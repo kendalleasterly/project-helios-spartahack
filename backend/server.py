@@ -604,15 +604,14 @@ async def video_frame_streaming(sid, data):
         # Detailed timing breakdown for latency monitoring
         if user_question:
             logger.info(
-                f"✅ [{mode}] COMPLETE: {total_time:.0f}ms total | "
+                f"✅ [CONVERSATION] COMPLETE: {total_time:.0f}ms total | "
                 f"YOLO: {inference_ms:.0f}ms | "
-                f"Objects: {len(objects)} | "
-                f"Response: {response_text[:80] if response_text else 'N/A'}..."
+                f"Objects: {len(objects)}"
             )
         else:
             # Vision pipeline - just cache update
             logger.debug(
-                f"✅ [{mode}] COMPLETE: {total_time:.0f}ms | "
+                f"✅ [VISION] COMPLETE: {total_time:.0f}ms | "
                 f"YOLO: {inference_ms:.0f}ms | Objects: {len(objects)} | "
                 f"Emergency: {emergency_stop}"
             )

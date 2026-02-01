@@ -21,6 +21,9 @@ from google.genai.types import Part, GenerateContentConfig, ThinkingConfig
 from face_service import FaceService
 from note_service import NoteService
 
+# Heuristics engine for collision detection
+from heuristics import evaluate_scene, UrgencyLevel, SpeakDecision, HeuristicsConfig
+
 load_dotenv()
 
 VISION_SYSTEM_PROMPT = """You are a proactive navigation guide for a blind person. Your job is to keep them SAFE and help them NAVIGATE. You see through their camera.
@@ -549,6 +552,10 @@ class BlindAssistantService:
         # Track announced people (to avoid spam - announce once per session)
         self._announced_people: set = set()  # Set of person_ids we've announced
 
+        # Heuristics state tracking for collision detection
+        self.last_spoke_time: float = 0.0  # Timestamp of last speech output
+        self.heuristics_config = HeuristicsConfig()
+
     async def process_frame(
         self,
         frame_base64: str,
@@ -683,30 +690,58 @@ class BlindAssistantService:
             face_detection_ms = (time.time() - face_detection_start) * 1000
             logger.error(f"Error in face detection after {face_detection_ms:.0f}ms: {e}", exc_info=True)
 
-        # Check for immediate danger (ONLY time vision pipeline speaks on its own)
-        immediate_danger = self._check_immediate_danger(yolo_objects)
-        if immediate_danger:
-            # Store in history and return emergency warning
-            snapshot = SceneSnapshot(
-                timestamp=time.time(),
-                yolo_objects=yolo_objects,
-                scene_description=immediate_danger,
-                frame_base64=frame_base64 if self.config.store_frames else None
-            )
-            self.scene_history.append(snapshot)
-            return immediate_danger
+        # Use heuristics engine to decide if we should speak
+        # Calculate time since last speech for debouncing
+        current_time = time.time()
+        last_spoke_seconds_ago = current_time - self.last_spoke_time
 
-        # No emergency: silently update spatial memory without calling Gemini
-        # Gemini will only be called when user asks a question (conversation pipeline)
+        # Get recent object labels for debouncing INFO-level alerts
+        recent_objects = self._get_recent_object_labels(lookback_seconds=10.0)
+
+        # Use heuristics to decide if we should speak
+        decision: SpeakDecision = evaluate_scene(
+            scene_analysis=yolo_objects,
+            recent_objects=recent_objects,
+            last_spoke_seconds_ago=last_spoke_seconds_ago,
+            config=self.heuristics_config
+        )
+
+        logger.info(
+            f"🎯 HEURISTICS | should_speak={decision.should_speak} | "
+            f"urgency={decision.urgency.value} | reason={decision.reason}"
+        )
+
+        # Always update spatial memory
         snapshot = SceneSnapshot(
-            timestamp=time.time(),
+            timestamp=current_time,
             yolo_objects=yolo_objects,
-            scene_description="SILENT (no question asked)",  # Placeholder
+            scene_description=decision.reason,
             frame_base64=frame_base64 if self.config.store_frames else None
         )
         self.scene_history.append(snapshot)
 
-        return None  # Stay silent unless emergency
+        # If heuristics say don't speak, stay silent
+        if not decision.should_speak:
+            return None
+
+        # Heuristics triggered: return warning message
+        logger.info(f"🔊 COLLISION WARNING | Urgency: {decision.urgency.value}")
+
+        # Update last spoke time
+        self.last_spoke_time = current_time
+
+        # Return the warning message
+        response_text = decision.reason
+
+        # Update history with what we are about to say
+        self.scene_history[-1] = SceneSnapshot(
+            timestamp=current_time,
+            yolo_objects=yolo_objects,
+            scene_description=response_text,
+            frame_base64=frame_base64 if self.config.store_frames else None
+        )
+
+        return response_text
 
     def get_person_detection_notification(self) -> Optional[Dict[str, Any]]:
         """
@@ -974,6 +1009,31 @@ class BlindAssistantService:
             vertical = "bottom"
 
         return f"{vertical}-{horizontal}"
+
+    def _get_recent_object_labels(self, lookback_seconds: float = 10.0) -> set[str]:
+        """
+        Get labels of objects seen in the recent past for debouncing.
+
+        Args:
+            lookback_seconds: How far back to look (default 10 seconds)
+
+        Returns:
+            Set of object labels seen recently
+        """
+        if not self.scene_history:
+            return set()
+
+        cutoff_time = time.time() - lookback_seconds
+        recent_labels: set[str] = set()
+
+        for scene in self.scene_history:
+            if scene.timestamp >= cutoff_time:
+                for obj in scene.yolo_objects.get("objects", []):
+                    label = obj.get("label")
+                    if label:
+                        recent_labels.add(label)
+
+        return recent_labels
 
     def _check_immediate_danger(self, yolo_objects: Dict[str, Any]) -> Optional[str]:
         """

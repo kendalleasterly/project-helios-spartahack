@@ -17,7 +17,10 @@
       "infoPlist": {
         "ITSAppUsesNonExemptEncryption": false,
         "NSMicrophoneUsageDescription": "A-eye needs microphone access to stream audio.",
-        "NSCameraUsageDescription": "Helios needs camera access to provide visual guidance and navigation assistance."
+        "NSCameraUsageDescription": "Helios needs camera access to provide visual guidance and navigation assistance.",
+        "NSAppTransportSecurity": {
+          "NSAllowsArbitraryLoads": true
+        }
       }
     },
     "android": {
